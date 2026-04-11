@@ -1,3 +1,4 @@
+mod preview_sidecar;
 mod shader_library;
 
 use std::sync::Mutex;
@@ -14,6 +15,7 @@ struct AppState {
 pub fn run() {
   tauri::Builder::default()
     .manage(AppState::default())
+    .manage(preview_sidecar::SidecarState::default())
     .plugin(tauri_plugin_shell::init())
     .setup(|app| {
       if cfg!(debug_assertions) {
@@ -32,6 +34,9 @@ pub fn run() {
       shader_library::list_shaders,
       shader_library::load_shader,
       shader_library::save_shader,
+      preview_sidecar::spawn_preview_sidecar,
+      preview_sidecar::send_preview_command,
+      preview_sidecar::stop_preview_sidecar,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

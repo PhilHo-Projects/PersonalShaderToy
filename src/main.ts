@@ -5,7 +5,8 @@ import { computeUniforms } from './renderer/uniforms.js';
 import { BrowserPreviewHost } from './services/BrowserPreviewHost.js';
 import { HttpShaderLibraryService } from './services/HttpShaderLibraryService.js';
 import { LocalStorageSettingsStore } from './services/LocalStorageSettingsStore.js';
-import type { PreviewHostStatus } from './services/PreviewHost.js';
+import type { NativePreviewHost } from './services/NativePreviewHost.js';
+import type { PreviewHost, PreviewHostStatus } from './services/PreviewHost.js';
 import type { ShaderLibraryService } from './services/ShaderLibraryService.js';
 import type {
   AppState,
@@ -83,9 +84,17 @@ let fpsFrames = 0;
 let currentFps = 0;
 const pressedKeys = new Set<number>();
 
+const NATIVE_BACKENDS: PreviewBackend[] = ['dx12', 'vulkan', 'metal', 'opengl'];
+
+function isNativeBackend(backend: PreviewBackend): boolean {
+  return NATIVE_BACKENDS.includes(backend);
+}
+
 const app = document.getElementById('app')!;
 const outputPanel = new OutputPanel();
-const previewHost = new BrowserPreviewHost(initialRenderPreset);
+const browserPreviewHost = new BrowserPreviewHost(initialRenderPreset);
+let previewHost: PreviewHost = browserPreviewHost;
+let nativePreviewHost: NativePreviewHost | null = null;
 
 const toolbar = new Toolbar({
   onShaderTypeChange: (language) => switchShaderLanguage(language),
@@ -246,12 +255,18 @@ window.addEventListener('keyup', (event) => {
 });
 
 function getBackendOptions(status: PreviewHostStatus): PreviewBackendOption[] {
-  return (Object.keys(BACKEND_LABELS) as PreviewBackend[]).map((value) => ({
-    value,
-    label: BACKEND_LABELS[value],
-    disabled: !status.capabilities.availableBackends.includes(value),
-    reason: status.capabilities.unavailableBackends[value],
-  }));
+  return (Object.keys(BACKEND_LABELS) as PreviewBackend[]).map((value) => {
+    let disabled = !status.capabilities.availableBackends.includes(value);
+    let reason = status.capabilities.unavailableBackends[value];
+
+    // In Tauri mode, enable native backends even when browser host is active
+    if (isTauriRuntime() && isNativeBackend(value)) {
+      disabled = false;
+      reason = undefined;
+    }
+
+    return { value, label: BACKEND_LABELS[value], disabled, reason };
+  });
 }
 
 async function refreshShaderLibrary() {
@@ -301,8 +316,81 @@ async function applyPreviewBackend(backend: PreviewBackend) {
   state.preview.backend = backend;
   settings.set('preview-backend', backend);
   toolbar.setBackend(backend);
-  const status = await previewHost.setBackend(backend);
+
+  // In Tauri mode, switch between browser and native preview hosts
+  if (isTauriRuntime() && isNativeBackend(backend)) {
+    await switchToNativeHost(backend);
+    return;
+  }
+
+  // Switch back to browser host if currently on native
+  if (previewHost !== browserPreviewHost) {
+    await switchToBrowserHost();
+  }
+
+  const status = await browserPreviewHost.setBackend(backend);
   applyPreviewStatus(status);
+}
+
+async function switchToNativeHost(backend: PreviewBackend) {
+  // Lazy-import to avoid loading Tauri modules in browser mode
+  const { TauriNativePreviewBridge } = await import('./services/TauriNativePreviewBridge.js');
+  const { NativePreviewHost: NativePreviewHostClass } = await import('./services/NativePreviewHost.js');
+
+  // Dispose existing native host if switching backends
+  if (nativePreviewHost) {
+    nativePreviewHost.dispose();
+    nativePreviewHost = null;
+  }
+
+  const bridge = new TauriNativePreviewBridge(backend);
+  nativePreviewHost = new NativePreviewHostClass(bridge);
+
+  nativePreviewHost.onDiagnostic((level, message) => {
+    outputPanel.log(message, level as 'info' | 'success' | 'warning' | 'error');
+  });
+
+  // Swap DOM elements
+  renderArea.replaceChild(nativePreviewHost.element, previewHost.element);
+  previewHost = nativePreviewHost;
+
+  const status = await nativePreviewHost.initialize();
+  applyPreviewStatus(status);
+
+  // Send current document to the sidecar
+  if (state.currentSource) {
+    const docStatus = await nativePreviewHost.setDocument({
+      source: state.currentSource,
+      language: state.currentLanguage,
+    });
+    applyPreviewStatus(docStatus);
+  }
+
+  nativePreviewHost.setRenderPreset(currentRenderPreset);
+  outputPanel.log(`Switched to native preview (${backend}).`, 'info');
+}
+
+async function switchToBrowserHost() {
+  if (nativePreviewHost) {
+    nativePreviewHost.dispose();
+    renderArea.replaceChild(browserPreviewHost.element, nativePreviewHost.element);
+    nativePreviewHost = null;
+  }
+
+  previewHost = browserPreviewHost;
+
+  // Re-send current document to browser host
+  if (state.currentSource) {
+    await browserPreviewHost.setDocument({
+      source: state.currentSource,
+      language: state.currentLanguage,
+    });
+  }
+
+  browserPreviewHost.setRenderPreset(currentRenderPreset);
+  const rect = renderArea.getBoundingClientRect();
+  browserPreviewHost.updateStageSize(rect.width, rect.height);
+  outputPanel.log('Switched back to browser preview.', 'info');
 }
 
 function applyRenderPreset(presetId: string, shouldLog = true) {
@@ -395,13 +483,22 @@ function setCompileState(status: PreviewCompileStatus, message = '') {
 
 function getPreviewStats(u?: ReturnType<typeof computeUniforms>): PreviewStats {
   const status = previewHost.getStatus();
+
+  // Use native sidecar FPS/frame when in native mode
+  let fps = currentFps;
+  let frame = state.frameCount;
+  if (previewHost.runtime === 'native' && nativePreviewHost) {
+    fps = nativePreviewHost.getNativeFps();
+    frame = nativePreviewHost.getNativeFrame();
+  }
+
   return {
     runtime: status.runtime,
     backend: status.requestedBackend,
     rendererLabel: status.rendererLabel,
     resolution: `${currentRenderPreset.width}x${currentRenderPreset.height}`,
-    fps: currentFps,
-    frame: state.frameCount,
+    fps,
+    frame,
     time: u ? u.iTime : state.pausedTime,
     compileStatus: lastCompileStatus,
   };
@@ -499,12 +596,12 @@ async function bootstrap() {
     const { TauriShaderLibraryService } = await import('./services/TauriShaderLibraryService.js');
     shaderLibrary = new TauriShaderLibraryService();
     outputPanel.log('Tauri runtime detected; local shader library commands are active.', 'info');
-    outputPanel.log('Browser preview host remains active during migration.', 'info');
+    outputPanel.log('Native preview backends (DX12, Vulkan, Metal, OpenGL) available via backend selector.', 'info');
   } else {
     outputPanel.log('Browser runtime detected.', 'info');
   }
 
-  const hostStatus = await previewHost.initialize();
+  const hostStatus = await browserPreviewHost.initialize();
   applyPreviewStatus(hostStatus);
 
   if (hostStatus.capabilities.availableBackends.includes('webgpu')) {

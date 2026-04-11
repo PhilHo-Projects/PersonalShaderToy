@@ -103,3 +103,8 @@
 - Browser preview orchestration is routed through `PreviewHost`.
 - Tauri v2 shell scaffolding is present and validated with a debug build.
 - Native preview sidecar scaffolding exists under `native/preview-sidecar` with a minimal JSON command/event protocol.
+- Tauri commands (`spawn_preview_sidecar`, `send_preview_command`, `stop_preview_sidecar`) manage the sidecar process lifecycle.
+- `TauriNativePreviewBridge` relays commands/events between the frontend and the sidecar via Tauri invoke/listen.
+- `NativePreviewHost` implements `PreviewHost` for the native sidecar, handling stats, diagnostics, and compile status.
+- `main.ts` swaps between `BrowserPreviewHost` and `NativePreviewHost` based on the selected backend and Tauri runtime detection.
+- Native backends (DX12, Vulkan, Metal, OpenGL) are enabled in the toolbar backend selector when running in Tauri mode.

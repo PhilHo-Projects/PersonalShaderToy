@@ -2,14 +2,15 @@
 
 ## Current Phase
 
-- `Phase 1 / Phase 2 foundation`
+- `Phase 3 / Phase 4 — sidecar integration`
 
 ## Phase Status
 
 - Documentation/bootstrap: `complete`
-- Browser modularization: `in progress`
-- Tauri shell: `scaffolded and validated`
-- Native sidecar: `scaffolded and compiling`
+- Browser modularization: `complete`
+- Tauri shell: `complete`
+- Native sidecar: `wired into Tauri shell`
+- Tauri <-> sidecar integration: `initial wiring complete`
 - Engine export: `deferred`
 
 ## Exit Criteria For The Current Stage
@@ -20,16 +21,22 @@
 - Browser file access and preview logic are behind replaceable interfaces.
 - Current browser workflow still builds and runs.
 - Tauri shell can build against the current frontend without the Express shader server.
+- Native preview sidecar is spawned from Tauri commands and communicates via stdin/stdout JSON.
+- Backend selector in desktop mode enables native backends (DX12, Vulkan, Metal, OpenGL).
+- Selecting a native backend spawns the sidecar, swaps the preview panel, and streams stats/diagnostics.
+- Switching back to a browser backend (WebGL2/WebGPU) stops the sidecar and restores browser preview.
 
 ## Next Milestone
 
-- Wire the native preview bridge into the Tauri shell and replace the browser preview in desktop mode.
+- End-to-end testing of the native preview path in a Tauri debug build.
+- Add crash recovery and auto-restart for the sidecar process.
+- Input forwarding (mouse/keyboard) from Tauri UI to sidecar window.
 
 ## Current Blockers / Watch Items
 
-- No git repo has been initialized yet, so local change tracking is file-based.
-- The current app still has a central `src/main.ts`, but it now depends on service seams instead of raw fetch/websocket/renderer globals.
-- Native preview spawning and lifecycle are scaffolded but not yet wired into the desktop UI.
+- Sidecar binary path is resolved from the cargo build directory; production bundling is not yet configured.
+- Backend switching requires restarting the sidecar process (the current sidecar does not support runtime backend changes).
+- Native preview currently only accepts WGSL shaders; GLSL and HLSL require translation before sending to sidecar.
 
 ## Verified Milestones
 
@@ -37,8 +44,10 @@
 - `cargo check` in `src-tauri/`
 - `cargo check` in `native/preview-sidecar/`
 - `npm run tauri:build -- --debug`
+- Git repo initialized with all Codex work committed.
 
 ## Notes
 
 - Browser mode remains the baseline verification environment while desktop mode is scaffolded.
 - Tauri and native preview work should not regress the existing shader editing workflow.
+- The sidecar is spawned via `std::process::Command` in Tauri Rust commands, not via the Tauri shell plugin JS API. This gives Tauri ownership of the process lifecycle.

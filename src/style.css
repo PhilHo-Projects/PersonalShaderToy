@@ -375,6 +375,20 @@ html, body {
 
 .canvas-panel canvas.hidden { display: none; }
 
+.native-preview-stage {
+  width: 100% !important;
+  height: 100% !important;
+  background: var(--bg-secondary);
+}
+
+.native-preview-status {
+  padding: 24px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+  user-select: none;
+}
+
 .output-panel {
   height: 220px;
   min-height: 220px;
