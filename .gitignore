@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.vite/
+*.log
+.codex-*
+.playwright-cli/
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+native/target/
+*.pdb
+*.ilk
+*.dSYM

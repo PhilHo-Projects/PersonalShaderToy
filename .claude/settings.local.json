@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx vite:*)",
+      "Bash(npx tsc:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npx kill-port:*)",
+      "Bash(lsof -ti:5199)",
+      "Bash(xargs -r kill -9)",
+      "Bash(netstat -ano)",
+      "Bash(timeout 5 sleep 4)",
+      "Bash(timeout 8 sleep 7)",
+      "Bash(timeout 6 sleep 5)",
+      "Bash(timeout 10 sleep 9)",
+      "Bash(timeout 4 sleep 3)",
+      "Bash(timeout 12 sleep 11)"
+    ]
+  }
+}
