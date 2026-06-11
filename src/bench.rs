@@ -133,6 +133,256 @@ pub fn load_sweep(path: &std::path::Path) -> Result<SweepResult, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone)]
+pub struct BenchConfig {
+    pub warmup_secs: f64,
+    pub measure_secs: f64,
+    /// UI labels of the backends to sweep, in order (BackendChoice::label()).
+    pub backend_labels: Vec<String>,
+    /// Force Immediate (fallback Mailbox→Fifo) present mode during the sweep.
+    pub force_uncapped: bool,
+}
+
+#[derive(Debug)]
+pub enum BenchAction {
+    None,
+    SwitchBackend { label: String },
+    Finished,
+}
+
+#[derive(Debug)]
+enum Phase {
+    /// Next backend switch not yet handed to the host.
+    PendingSwitch(usize),
+    /// Switch handed out; waiting for backend_ready / backend_failed.
+    WaitingReady(usize),
+    Warmup {
+        index: usize,
+        started: f64,
+        meta: RunMeta,
+    },
+    Measuring {
+        index: usize,
+        started: f64,
+        meta: RunMeta,
+        cpu_ms: Vec<f64>,
+        gpu_ms: Vec<f64>,
+        frames: u32,
+    },
+    /// All backends processed; Finished not yet consumed via take_result.
+    PendingFinish,
+    Done,
+}
+
+#[derive(Debug, Clone)]
+struct RunMeta {
+    backend: String,
+    adapter: String,
+    present_mode: String,
+    resolution: [u32; 2],
+    pipeline_compile_ms: Option<f64>,
+}
+
+/// Pure sweep state machine. The host (main.rs) polls `next_action()` once per
+/// frame, executes renderer swaps, and reports back through `backend_ready` /
+/// `backend_failed` and `record_frame`. The clock is abstract seconds so the
+/// whole machine is testable without a GPU or real time.
+pub struct BenchRunner {
+    config: BenchConfig,
+    phase: Phase,
+    runs: Vec<RunRecord>,
+}
+
+impl BenchRunner {
+    pub fn new(config: BenchConfig) -> Self {
+        let phase = if config.backend_labels.is_empty() {
+            Phase::PendingFinish
+        } else {
+            Phase::PendingSwitch(0)
+        };
+        Self {
+            config,
+            phase,
+            runs: Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !matches!(self.phase, Phase::Done)
+    }
+
+    pub fn config(&self) -> &BenchConfig {
+        &self.config
+    }
+
+    /// Poll once per frame. `SwitchBackend` is returned exactly once per
+    /// backend; `Finished` repeats until `take_result` consumes it so the
+    /// host cannot miss it.
+    pub fn next_action(&mut self) -> BenchAction {
+        match &self.phase {
+            Phase::PendingSwitch(i) => {
+                let label = self.config.backend_labels[*i].clone();
+                self.phase = Phase::WaitingReady(*i);
+                BenchAction::SwitchBackend { label }
+            }
+            Phase::PendingFinish => BenchAction::Finished,
+            _ => BenchAction::None,
+        }
+    }
+
+    /// Call when the swapped backend is up and the shader compiled on it.
+    /// No-op outside the WaitingReady phase, so unconditional calls are safe.
+    pub fn backend_ready(
+        &mut self,
+        now: f64,
+        backend: String,
+        adapter: String,
+        present_mode: String,
+        resolution: [u32; 2],
+        pipeline_compile_ms: Option<f64>,
+    ) {
+        if let Phase::WaitingReady(i) = self.phase {
+            self.phase = Phase::Warmup {
+                index: i,
+                started: now,
+                meta: RunMeta {
+                    backend,
+                    adapter,
+                    present_mode,
+                    resolution,
+                    pipeline_compile_ms,
+                },
+            };
+        }
+    }
+
+    /// Call when the backend swap or shader compile failed. Records a failed
+    /// run and moves on. No-op outside WaitingReady.
+    pub fn backend_failed(&mut self, reason: String) {
+        if let Phase::WaitingReady(i) = self.phase {
+            let label = self.config.backend_labels[i].clone();
+            self.runs.push(RunRecord {
+                backend: label,
+                adapter: String::new(),
+                present_mode: String::new(),
+                resolution: [0, 0],
+                frames: 0,
+                cpu: None,
+                gpu: None,
+                pipeline_compile_ms: None,
+                error: Some(reason),
+            });
+            self.advance(i);
+        }
+    }
+
+    /// Feed one completed frame. Warmup frames are dropped; the frame that
+    /// crosses into the measure window is the first counted sample; the frame
+    /// that crosses past the window finalizes the run without being counted.
+    pub fn record_frame(&mut self, now: f64, cpu_ms: f64, gpu_ms: Option<f64>) {
+        match &mut self.phase {
+            Phase::Warmup {
+                index,
+                started,
+                meta,
+            } => {
+                if now - *started >= self.config.warmup_secs {
+                    self.phase = Phase::Measuring {
+                        index: *index,
+                        started: now,
+                        meta: meta.clone(),
+                        cpu_ms: vec![cpu_ms],
+                        gpu_ms: gpu_ms.into_iter().collect(),
+                        frames: 1,
+                    };
+                }
+            }
+            Phase::Measuring {
+                index,
+                started,
+                meta,
+                cpu_ms: cpu,
+                gpu_ms: gpu,
+                frames,
+            } => {
+                if now - *started >= self.config.measure_secs {
+                    let record = RunRecord {
+                        backend: meta.backend.clone(),
+                        adapter: meta.adapter.clone(),
+                        present_mode: meta.present_mode.clone(),
+                        resolution: meta.resolution,
+                        frames: *frames,
+                        cpu: FrameStats::from_samples_ms(cpu),
+                        gpu: FrameStats::from_samples_ms(gpu),
+                        pipeline_compile_ms: meta.pipeline_compile_ms,
+                        error: None,
+                    };
+                    let i = *index;
+                    self.runs.push(record);
+                    self.advance(i);
+                } else {
+                    cpu.push(cpu_ms);
+                    if let Some(g) = gpu_ms {
+                        gpu.push(g);
+                    }
+                    *frames += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Consume the finished sweep. Returns None unless the runner reached the
+    /// PendingFinish phase (i.e. next_action returned Finished).
+    pub fn take_result(&mut self, shader: String) -> Option<SweepResult> {
+        if !matches!(self.phase, Phase::PendingFinish) {
+            return None;
+        }
+        self.phase = Phase::Done;
+        Some(SweepResult {
+            shader,
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            warmup_secs: self.config.warmup_secs,
+            measure_secs: self.config.measure_secs,
+            runs: std::mem::take(&mut self.runs),
+        })
+    }
+
+    pub fn status_line(&self) -> String {
+        match &self.phase {
+            Phase::PendingSwitch(i) | Phase::WaitingReady(i) => {
+                format!(
+                    "Benchmark: switching to {}…",
+                    self.config.backend_labels[*i]
+                )
+            }
+            Phase::Warmup { index, .. } => {
+                format!("Benchmark: {} warmup…", self.config.backend_labels[*index])
+            }
+            Phase::Measuring { index, frames, .. } => {
+                format!(
+                    "Benchmark: measuring {} ({} frames)…",
+                    self.config.backend_labels[*index], frames
+                )
+            }
+            Phase::PendingFinish => "Benchmark: finishing…".to_string(),
+            Phase::Done => "Benchmark: done".to_string(),
+        }
+    }
+
+    fn advance(&mut self, finished_index: usize) {
+        let next = finished_index + 1;
+        self.phase = if next < self.config.backend_labels.len() {
+            Phase::PendingSwitch(next)
+        } else {
+            Phase::PendingFinish
+        };
+    }
+}
+
 /// Saved sweeps in `dir`, newest first (file names end in a unix timestamp).
 pub fn list_sweeps(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -229,6 +479,112 @@ mod tests {
             sweep_filename("Kerr Newman (v2).glsl", 123),
             "kerr-newman-v2-glsl-123.json"
         );
+    }
+
+    fn cfg2() -> BenchConfig {
+        BenchConfig {
+            warmup_secs: 1.0,
+            measure_secs: 2.0,
+            backend_labels: vec!["DirectX 12".into(), "Vulkan".into()],
+            force_uncapped: true,
+        }
+    }
+
+    #[test]
+    fn runner_happy_path_two_backends() {
+        let mut r = BenchRunner::new(cfg2());
+        assert!(r.is_active());
+
+        // First action: switch to first backend. Returned exactly once.
+        let BenchAction::SwitchBackend { label } = r.next_action() else {
+            panic!()
+        };
+        assert_eq!(label, "DirectX 12");
+        assert!(matches!(r.next_action(), BenchAction::None));
+
+        r.backend_ready(
+            0.0,
+            "Dx12".into(),
+            "GPU A".into(),
+            "Immediate".into(),
+            [800, 600],
+            Some(10.0),
+        );
+        // Warmup frames (t < 1.0) are not counted.
+        r.record_frame(0.5, 4.0, Some(2.0));
+        // Crossing into measure window.
+        r.record_frame(1.1, 8.0, Some(4.0));
+        r.record_frame(1.6, 8.0, None);
+        r.record_frame(1.9, 8.0, Some(4.0));
+        // Crossing past measure end finalizes the run.
+        r.record_frame(3.2, 8.0, Some(4.0));
+
+        let BenchAction::SwitchBackend { label } = r.next_action() else {
+            panic!()
+        };
+        assert_eq!(label, "Vulkan");
+        r.backend_ready(
+            4.0,
+            "Vulkan".into(),
+            "GPU A".into(),
+            "Mailbox".into(),
+            [800, 600],
+            None,
+        );
+        r.record_frame(5.1, 5.0, None);
+        r.record_frame(5.5, 5.0, None);
+        r.record_frame(7.2, 5.0, None);
+
+        assert!(matches!(r.next_action(), BenchAction::Finished));
+        let result = r.take_result("shader.wgsl".into()).unwrap();
+        assert_eq!(result.runs.len(), 2);
+        let dx = &result.runs[0];
+        assert_eq!(dx.backend, "Dx12");
+        assert_eq!(dx.present_mode, "Immediate");
+        assert_eq!(dx.frames, 3);
+        assert_eq!(dx.cpu.as_ref().unwrap().count, 3);
+        // GPU samples: only 2 of the 3 measured frames had Some.
+        assert_eq!(dx.gpu.as_ref().unwrap().count, 2);
+        assert_eq!(dx.pipeline_compile_ms, Some(10.0));
+        assert!(dx.error.is_none());
+        assert_eq!(result.runs[1].backend, "Vulkan");
+        assert!(!r.is_active());
+    }
+
+    #[test]
+    fn runner_backend_failure_continues_sweep() {
+        let mut r = BenchRunner::new(cfg2());
+        let BenchAction::SwitchBackend { .. } = r.next_action() else {
+            panic!()
+        };
+        r.backend_failed("no adapter".into());
+
+        let BenchAction::SwitchBackend { label } = r.next_action() else {
+            panic!()
+        };
+        assert_eq!(label, "Vulkan");
+        r.backend_ready(0.0, "Vulkan".into(), "GPU".into(), "Fifo".into(), [64, 64], None);
+        r.record_frame(1.5, 5.0, None);
+        r.record_frame(1.7, 5.0, None);
+        r.record_frame(3.6, 5.0, None);
+
+        assert!(matches!(r.next_action(), BenchAction::Finished));
+        let result = r.take_result("s".into()).unwrap();
+        assert_eq!(result.runs[0].error.as_deref(), Some("no adapter"));
+        assert!(result.runs[0].cpu.is_none());
+        assert!(result.runs[1].error.is_none());
+    }
+
+    #[test]
+    fn runner_status_line_mentions_phase() {
+        let mut r = BenchRunner::new(cfg2());
+        let _ = r.next_action();
+        assert!(r.status_line().contains("DirectX 12"));
+        r.backend_ready(0.0, "Dx12".into(), "G".into(), "Fifo".into(), [1, 1], None);
+        r.record_frame(0.2, 1.0, None);
+        assert!(r.status_line().to_lowercase().contains("warmup"));
+        r.record_frame(1.2, 1.0, None);
+        assert!(r.status_line().to_lowercase().contains("measur"));
     }
 
     #[test]
