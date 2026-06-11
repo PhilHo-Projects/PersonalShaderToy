@@ -46,6 +46,8 @@ const PREVIEW_STATUS_ROW_HEIGHT: f32 = 22.0;
 const PREVIEW_LOG_HEIGHT: f32 = 200.0;
 const PREVIEW_LAYOUT_GUTTER: f32 = 30.0;
 const SCREENSHOT_DIR: &str = "target/native-captures";
+/// Rolling frame-time window for live percentile stats (~10s at 60fps).
+const STATS_HISTORY: usize = 600;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // WGSL templates — matching the browser WebGPURenderer for shader compatibility
@@ -710,6 +712,11 @@ struct PreviewApp {
     surface_reconfigure_needed: bool,
     /// (pass name, milliseconds) for the most recent pipeline build.
     pipeline_compile_ms: Vec<(String, f64)>,
+    /// Rolling CPU frame-time history (ms), capped at STATS_HISTORY frames.
+    cpu_frame_history: std::collections::VecDeque<f64>,
+    /// Rolling GPU frame-time history (ms) from GpuTimer, same cap.
+    gpu_frame_history: std::collections::VecDeque<f64>,
+    last_frame_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1122,6 +1129,9 @@ impl PreviewApp {
             active_present_mode: wgpu::PresentMode::Fifo,
             surface_reconfigure_needed: false,
             pipeline_compile_ms: Vec::new(),
+            cpu_frame_history: std::collections::VecDeque::new(),
+            gpu_frame_history: std::collections::VecDeque::new(),
+            last_frame_at: None,
         }
     }
 
@@ -2159,6 +2169,17 @@ impl PreviewApp {
     }
 
     fn render(&mut self) {
+        // CPU frame time = wall-clock delta between render() entries.
+        let frame_now = Instant::now();
+        if let Some(prev) = self.last_frame_at {
+            let cpu_ms = frame_now.duration_since(prev).as_secs_f64() * 1000.0;
+            self.cpu_frame_history.push_back(cpu_ms);
+            while self.cpu_frame_history.len() > STATS_HISTORY {
+                self.cpu_frame_history.pop_front();
+            }
+        }
+        self.last_frame_at = Some(frame_now);
+
         self.process_compile_updates();
 
         // Cheap settings application: present mode and frame latency only need
@@ -2223,8 +2244,18 @@ impl PreviewApp {
         // Harvest any completed GPU timestamp readbacks before encoding the
         // new frame so `latest()` reflects the freshest finished frame.
         if let Some(t) = r.gpu_timer.as_mut() {
-            t.begin_frame();
+            for total_ms in t.begin_frame() {
+                self.gpu_frame_history.push_back(total_ms);
+                while self.gpu_frame_history.len() > STATS_HISTORY {
+                    self.gpu_frame_history.pop_front();
+                }
+            }
         }
+        let gpu_latest_timing = r
+            .gpu_timer
+            .as_ref()
+            .and_then(|t| t.latest())
+            .cloned();
         let ppp = r.egui_ctx.pixels_per_point();
 
         let raw_input = r.egui_state.take_egui_input(self.window.as_ref().unwrap());
@@ -2280,23 +2311,31 @@ impl PreviewApp {
             };
 
         let mut render_preview_workspace = |ui: &mut egui::Ui| {
-            let fps_val =
-                self.frame_counter as f64 / self.last_stats_at.elapsed().as_secs_f64().max(0.001);
+            let cpu_samples: Vec<f64> = self.cpu_frame_history.iter().copied().collect();
+            let cpu_stats = bench::FrameStats::from_samples_ms(&cpu_samples);
+            let gpu_samples: Vec<f64> = self.gpu_frame_history.iter().copied().collect();
+            let gpu_stats = bench::FrameStats::from_samples_ms(&gpu_samples);
             let runtime_label = format_runtime(self.start_time.elapsed());
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("📊 Stats").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "FPS: {:.0} | {:.1}ms | Runtime: {} | Frame: {}",
-                            fps_val,
-                            self.last_frame_time * 1000.0,
+                    let stats_text = match &cpu_stats {
+                        Some(s) => format!(
+                            "FPS: {:.0} | avg {:.2}ms p95 {:.2} p99 {:.2} | 1% low {:.0} fps | {}",
+                            s.avg_fps(),
+                            s.avg_ms,
+                            s.p95_ms,
+                            s.p99_ms,
+                            s.low_1pct_fps(),
                             runtime_label,
-                            self.total_frames
-                        ))
-                        .size(13.5)
-                        .color(egui::Color32::from_rgb(145, 205, 145)),
+                        ),
+                        None => format!("Runtime: {runtime_label}"),
+                    };
+                    ui.label(
+                        egui::RichText::new(stats_text)
+                            .size(13.5)
+                            .color(egui::Color32::from_rgb(145, 205, 145)),
                     );
                 });
             });
@@ -2312,6 +2351,31 @@ impl PreviewApp {
                             .size(12.5)
                             .color(egui::Color32::from_rgb(155, 175, 235)),
                     );
+                }
+                let gpu_text = match &gpu_stats {
+                    Some(s) => format!("GPU: {:.2}ms avg, p95 {:.2}", s.avg_ms, s.p95_ms),
+                    None => "GPU: n/a".to_string(),
+                };
+                ui.label(
+                    egui::RichText::new(gpu_text)
+                        .size(12.5)
+                        .color(egui::Color32::from_rgb(205, 175, 145)),
+                );
+                if let Some(timing) = &gpu_latest_timing {
+                    if timing.pass_ms.len() > 1 {
+                        let breakdown = timing
+                            .pass_ms
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ms)| format!("p{i}: {ms:.2}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        ui.label(
+                            egui::RichText::new(breakdown)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(170, 150, 130)),
+                        );
+                    }
                 }
             });
             ui.separator();

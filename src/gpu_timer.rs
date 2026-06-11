@@ -71,12 +71,16 @@ impl GpuTimer {
     }
 
     /// Harvest finished readbacks and reset the per-frame pass counter.
-    pub fn begin_frame(&mut self) {
+    /// Returns the total GPU ms of each newly completed frame (usually 0 or 1
+    /// entries; more if several readbacks landed at once) so callers can feed
+    /// per-frame histories without double-counting stale values.
+    pub fn begin_frame(&mut self) -> Vec<f64> {
         self.passes_this_frame = 0;
         let done: Vec<(usize, Vec<u64>)> = {
             let mut guard = self.completed.lock().unwrap();
             guard.drain(..).collect()
         };
+        let mut new_totals = Vec::new();
         for (slot, raw) in done {
             if let Some(pos) = self.in_flight.iter().position(|(s, _)| *s == slot) {
                 let (_, pass_count) = self.in_flight.remove(pos).unwrap();
@@ -88,10 +92,12 @@ impl GpuTimer {
                     pass_ms.push(delta_ns / 1_000_000.0);
                 }
                 let total_ms = pass_ms.iter().sum();
+                new_totals.push(total_ms);
                 self.latest = Some(FrameGpuTiming { pass_ms, total_ms });
                 self.free_slots.push(slot);
             }
         }
+        new_totals
     }
 
     /// Allocate begin/end query indices for the next shader pass this frame.
