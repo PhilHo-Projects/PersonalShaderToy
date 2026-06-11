@@ -26,6 +26,7 @@ use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State as EguiWinitState;
 
 mod bench;
+mod gpu_timer;
 mod render_settings;
 
 use render_settings::BackendChoice;
@@ -630,6 +631,9 @@ struct RendererState {
     keyboard_view: wgpu::TextureView,
 
     mode: ShaderMode,
+
+    /// None when the backend lacks timestamp queries (e.g. most GL).
+    gpu_timer: Option<gpu_timer::GpuTimer>,
 
     egui_ctx: egui::Context,
     egui_state: EguiWinitState,
@@ -1599,6 +1603,14 @@ impl PreviewApp {
             },
         );
 
+        let frame_gpu_timer = gpu_timer::GpuTimer::new(&device, &queue);
+        if frame_gpu_timer.is_none() {
+            self.push_diagnostic(
+                DiagLevel::Info,
+                "GPU timestamps unavailable on this backend (CPU timing only).".to_string(),
+            );
+        }
+
         self.active_backend_name = format!("{:?}", adapter_info.backend);
         self.active_adapter_name = adapter_info.name.clone();
         self.active_driver_name = adapter_info.driver.clone();
@@ -1622,6 +1634,7 @@ impl PreviewApp {
             keyboard_texture,
             keyboard_view,
             mode: ShaderMode::None,
+            gpu_timer: frame_gpu_timer,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -2207,6 +2220,11 @@ impl PreviewApp {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
+        // Harvest any completed GPU timestamp readbacks before encoding the
+        // new frame so `latest()` reflects the freshest finished frame.
+        if let Some(t) = r.gpu_timer.as_mut() {
+            t.begin_frame();
+        }
         let ppp = r.egui_ctx.pixels_per_point();
 
         let raw_input = r.egui_state.take_egui_input(self.window.as_ref().unwrap());
@@ -3053,6 +3071,10 @@ impl PreviewApp {
                                     store: wgpu::StoreOp::Store,
                                 },
                             })],
+                            timestamp_writes: r
+                                .gpu_timer
+                                .as_mut()
+                                .and_then(|t| t.pass_timestamp_writes()),
                             ..Default::default()
                         });
                         pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
@@ -3202,6 +3224,10 @@ impl PreviewApp {
                                                 },
                                             },
                                         )],
+                                        timestamp_writes: r
+                                            .gpu_timer
+                                            .as_mut()
+                                            .and_then(|t| t.pass_timestamp_writes()),
                                         ..Default::default()
                                     });
                                 if cp.is_image {
@@ -3231,7 +3257,18 @@ impl PreviewApp {
             // the popup overlay.
             let needs_post_encoder = !popup_paint_jobs.is_empty() || self.screenshot_requested;
 
+            // Resolve GPU timestamps into a readback slot inside this frame's
+            // command stream, then kick off the async map after submit.
+            let timer_slot = r
+                .gpu_timer
+                .as_mut()
+                .and_then(|t| t.resolve(&mut encoder));
+
             r.queue.submit(Some(encoder.finish()));
+
+            if let (Some(t), Some(slot)) = (r.gpu_timer.as_mut(), timer_slot) {
+                t.after_submit(slot);
+            }
 
             // 4. Egui popup pass (Foreground/Tooltip layers) — drawn over the
             //    shader so dropdowns aren't clipped by the viewport.
