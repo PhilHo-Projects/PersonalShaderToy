@@ -48,6 +48,20 @@ const PEAK_TEMP_NORM: f32 = 0.4879; // 0.05665278^0.25
 const ACCRETION_RATE: f32 = 5e-4;
 const JET_BRIGHT_MUT: f32 = 1.0;
 
+// Heat-haze refraction params (mirrors original HAZE_* defines)
+const HAZE_ENABLE: bool = true;
+const HAZE_STRENGTH: f32 = 0.2;
+const HAZE_SCALE: f32 = 5.2;
+const HAZE_DENSITY_THRESHOLD: f32 = 0.1;
+const HAZE_LAYER_THICKNESS: f32 = 0.8;
+const HAZE_RADIAL_EXPAND: f32 = 0.8;
+const HAZE_ROT_SPEED: f32 = 0.2;
+const HAZE_FLOW_SPEED: f32 = 0.15;
+const HAZE_PROBE_STEPS: i32 = 10;
+const HAZE_STEP_SIZE: f32 = 0.05;
+const HAZE_DISK_DENSITY_REF: f32 = 30.0; // BRIGHT_MUT * 30
+const HAZE_JET_DENSITY_REF: f32 = 1.0;   // JET_BRIGHT_MUT * 1
+
 // ---- Section 2: Structs ----
 
 struct KerrGeo {
@@ -455,7 +469,10 @@ fn vec2_to_theta(v1: vec2<f32>, v2: vec2<f32>) -> f32 {
 // ---- Section 14: Background ----
 
 fn hash43x_bg(p: vec3<f32>) -> vec4<f32> {
-    var x = vec3<u32>(vec3<i32>(floor(p)));
+    // Matches GLSL `uvec3(ivec3(p))` which truncates toward zero, not floor.
+    // Using floor() here gives a different hash on negative coords, which shows
+    // up as an axis-aligned seam across cube-face boundaries in stars_bg.
+    var x = vec3<u32>(vec3<i32>(p));
     x = 1103515245u * ((x >> vec3<u32>(1u)) ^ x.yzx);
     let h = 1103515245u * ((x.x ^ x.z) ^ (x.y >> 3u));
     let rz = vec4<u32>(h, h * 16807u, h * 48271u, h * 69621u);
@@ -527,6 +544,236 @@ fn sample_bg(dir_in: vec3<f32>, shift: f32, status: f32) -> vec4<f32> {
     shifted *= orig_strength / max(new_strength, 1e-3);
 
     return vec4<f32>(shifted, backcolor.a) * pow(bg_shift, 4.0);
+}
+
+// ---- Section 14.5: Heat-Haze Refraction ----
+
+fn haze_noise01(p: vec3<f32>) -> f32 {
+    return perlin3(p) * 0.5 + 0.5;
+}
+
+fn get_base_noise(p: vec3<f32>) -> f32 {
+    let base_scale = HAZE_SCALE * 0.4;
+    // Tilt the noise lattice off the disk plane to avoid aliasing along XZ.
+    let rot_noise = mat3x3<f32>(
+        vec3<f32>( 0.80,  0.60,  0.00),
+        vec3<f32>(-0.48,  0.64,  0.60),
+        vec3<f32>(-0.36,  0.48, -0.80)
+    );
+    let pos = rot_noise * (p * base_scale);
+    let n1 = haze_noise01(pos);
+    let n2 = haze_noise01(pos * 3.0 + vec3<f32>(13.5, -2.4, 4.1));
+    return n1 * 0.6 + n2 * 0.4;
+}
+
+fn get_disk_haze_mask(pos_rg: vec3<f32>, inter_r: f32, outer_r: f32, thin: f32, hopper: f32) -> f32 {
+    let r = length(pos_rg.xz);
+    let y = abs(pos_rg.y);
+    let geo_thin = thin + max(0.0, (r - 3.0) * hopper);
+    let boundary_y = max(0.2, geo_thin * HAZE_LAYER_THICKNESS);
+    let v_mask = 1.0 - smoothstep(boundary_y * 0.5, boundary_y * 1.5, y);
+    let r_mask =
+        smoothstep(inter_r * 0.3, inter_r * 0.8, r) *
+        (1.0 - smoothstep(outer_r * HAZE_RADIAL_EXPAND * 0.75, outer_r * HAZE_RADIAL_EXPAND, r));
+    return v_mask * r_mask;
+}
+
+fn get_jet_haze_mask(pos_rg: vec3<f32>, inter_r: f32, outer_r: f32) -> f32 {
+    let r = length(pos_rg.xz);
+    let y = abs(pos_rg.y);
+    let core_lim = sqrt(2.0 * inter_r * inter_r + 0.03 * 0.03 * y * y);
+    let shell_lim = 1.3 * inter_r + 0.25 * y;
+    let max_jet_r = max(core_lim, shell_lim) * 1.2;
+    let j_len = outer_r * 0.8;
+    let r_mask = 1.0 - smoothstep(max_jet_r * 0.8, max_jet_r * 1.1, r);
+    let h_mask = 1.0 - smoothstep(j_len * 0.75, j_len * 1.0, y);
+    let start_y_mask = smoothstep(inter_r * 0.5, inter_r * 1.5, y);
+    return r_mask * h_mask * start_y_mask;
+}
+
+fn is_in_haze_bounding_volume(pos: vec3<f32>, probe_dist: f32, outer_r: f32) -> bool {
+    let max_r = outer_r * 1.2;
+    return length(pos) <= max_r + probe_dist;
+}
+
+fn get_haze_force(pos_rg: vec3<f32>, time: f32, phys_a: f32, phys_q: f32,
+                  inter_r: f32, outer_r: f32, thin: f32, hopper: f32,
+                  accretion_rate: f32) -> vec3<f32> {
+    let ln10 = 2.302585;
+
+    // Disk strength (dual log-scale mixing against absolute + relative refs)
+    let d_dens = HAZE_DISK_DENSITY_REF;
+    let d_factor_abs = clamp(log(d_dens / 20.0) / ln10, 0.0, 1.0);
+    let j_dens_ref = HAZE_JET_DENSITY_REF;
+    var d_factor_rel = 1.0;
+    if (j_dens_ref > 1e-20) {
+        d_factor_rel = clamp(log(d_dens / j_dens_ref) / ln10, 0.0, 1.0);
+    }
+    let disk_strength = d_factor_abs * d_factor_rel;
+
+    // Jet strength ramps in log-space from 1e-2 up to 1.0
+    var jet_strength = 0.0;
+    let jet_threshold = 1e-2;
+    if (accretion_rate >= jet_threshold) {
+        let log_rate = log(accretion_rate);
+        let log_min = log(jet_threshold);
+        let log_max = log(1.0);
+        jet_strength = clamp((log_rate - log_min) / (log_max - log_min), 0.0, 1.0);
+    }
+
+    if (disk_strength <= 0.001 && jet_strength <= 0.001) {
+        return vec3<f32>(0.0);
+    }
+
+    let eps = 0.1;
+
+    // Two-layer triangle-wave blending so noise samples fade in/out over time
+    let rot_speed = 100.0 * HAZE_ROT_SPEED;
+    let jet_speed = 50.0 * HAZE_FLOW_SPEED;
+    let reference_omega = kepler_omega(6.0, phys_a, phys_q);
+    let adaptive_freq = max(abs(reference_omega * rot_speed) / (TAU * 5.14), 0.1);
+    let flow_time = time * adaptive_freq;
+
+    let phase1 = fract(flow_time);
+    let phase2 = fract(flow_time + 0.5);
+    let weight1 = 1.0 - abs(2.0 * phase1 - 1.0);
+    let weight2 = 1.0 - abs(2.0 * phase2 - 1.0);
+    let do_layer1 = weight1 > 0.05;
+    let do_layer2 = weight2 > 0.05;
+    let w_raw1 = select(0.0, weight1, do_layer1);
+    let w_raw2 = select(0.0, weight2, do_layer2);
+    let w_total = w_raw1 + w_raw2;
+    let safe_total = max(w_total, 1e-6);
+    let w1_norm = select(0.0, weight1 / safe_total, do_layer1 && w_total > 0.0);
+    let w2_norm = select(0.0, weight2 / safe_total, do_layer2 && w_total > 0.0);
+
+    let t_offset1 = phase1 - 0.5;
+    let t_offset2 = phase2 - 0.5;
+
+    var total_force = vec3<f32>(0.0);
+
+    // Disk layer: rotate sample pos by Keplerian omega, then take gradient
+    if (disk_strength > 0.001) {
+        let mask_disk = get_disk_haze_mask(pos_rg, inter_r, outer_r, thin, hopper);
+        if (mask_disk > 0.001) {
+            let r_local = length(pos_rg.xz);
+            let omega = kepler_omega(r_local, phys_a, phys_q);
+            var grad_world = vec3<f32>(0.0);
+            var val_combined = 0.0;
+
+            if (do_layer1) {
+                let ang = omega * rot_speed * t_offset1;
+                let c = cos(ang); let s = sin(ang);
+                var q = pos_rg;
+                q.x = pos_rg.x * c - pos_rg.z * s;
+                q.z = pos_rg.x * s + pos_rg.z * c;
+                let v = get_base_noise(q);
+                let nx = get_base_noise(q + vec3<f32>(eps, 0.0, 0.0));
+                let ny = get_base_noise(q + vec3<f32>(0.0, eps, 0.0));
+                let nz = get_base_noise(q + vec3<f32>(0.0, 0.0, eps));
+                let g = vec3<f32>(nx - v, ny - v, nz - v);
+                // Rotate gradient back into world frame
+                grad_world += vec3<f32>(g.x * c + g.z * s, g.y, -g.x * s + g.z * c) * w1_norm;
+                val_combined += v * w1_norm;
+            }
+            if (do_layer2) {
+                let ang = omega * rot_speed * t_offset2;
+                let c = cos(ang); let s = sin(ang);
+                var q = pos_rg;
+                q.x = pos_rg.x * c - pos_rg.z * s;
+                q.z = pos_rg.x * s + pos_rg.z * c;
+                let v = get_base_noise(q);
+                let nx = get_base_noise(q + vec3<f32>(eps, 0.0, 0.0));
+                let ny = get_base_noise(q + vec3<f32>(0.0, eps, 0.0));
+                let nz = get_base_noise(q + vec3<f32>(0.0, 0.0, eps));
+                let g = vec3<f32>(nx - v, ny - v, nz - v);
+                grad_world += vec3<f32>(g.x * c + g.z * s, g.y, -g.x * s + g.z * c) * w2_norm;
+                val_combined += v * w2_norm;
+            }
+
+            var cloud = max(0.0, val_combined - HAZE_DENSITY_THRESHOLD);
+            cloud /= (1.0 - HAZE_DENSITY_THRESHOLD);
+            cloud = pow(cloud, 1.5);
+            total_force += grad_world * mask_disk * cloud * disk_strength;
+        }
+    }
+
+    // Jet layer: drift along y, simpler gradient (no rotation)
+    if (jet_strength > 0.001) {
+        let mask_jet = get_jet_haze_mask(pos_rg, inter_r, outer_r);
+        if (mask_jet > 0.001) {
+            let v_jet_mag = 0.9;
+            var grad = vec3<f32>(0.0);
+            var val_combined = 0.0;
+
+            if (do_layer1) {
+                let d = v_jet_mag * jet_speed * t_offset1;
+                var q = pos_rg;
+                q.y -= sign(pos_rg.y) * d;
+                let v = get_base_noise(q);
+                let nx = get_base_noise(q + vec3<f32>(eps, 0.0, 0.0));
+                let ny = get_base_noise(q + vec3<f32>(0.0, eps, 0.0));
+                let nz = get_base_noise(q + vec3<f32>(0.0, 0.0, eps));
+                grad += vec3<f32>(nx - v, ny - v, nz - v) * w1_norm;
+                val_combined += v * w1_norm;
+            }
+            if (do_layer2) {
+                let d = v_jet_mag * jet_speed * t_offset2;
+                var q = pos_rg;
+                q.y -= sign(pos_rg.y) * d;
+                let v = get_base_noise(q);
+                let nx = get_base_noise(q + vec3<f32>(eps, 0.0, 0.0));
+                let ny = get_base_noise(q + vec3<f32>(0.0, eps, 0.0));
+                let nz = get_base_noise(q + vec3<f32>(0.0, 0.0, eps));
+                grad += vec3<f32>(nx - v, ny - v, nz - v) * w2_norm;
+                val_combined += v * w2_norm;
+            }
+
+            let thr = 0.3 + 0.7 * HAZE_DENSITY_THRESHOLD;
+            var cloud = max(0.0, val_combined - thr);
+            cloud /= clamp(1.0 - thr, 0.0, 1.0);
+            cloud = pow(cloud, 1.5);
+            total_force += grad * mask_jet * cloud * jet_strength;
+        }
+    }
+
+    return total_force;
+}
+
+fn apply_heat_haze(pos_start: vec3<f32>, ray_dir_in: vec3<f32>) -> vec3<f32> {
+    if (!HAZE_ENABLE) { return ray_dir_in; }
+
+    let ray_dir_norm = safe_norm(ray_dir_in, vec3<f32>(0.0, 0.0, 1.0));
+    let total_probe_dist = f32(HAZE_PROBE_STEPS) * HAZE_STEP_SIZE;
+
+    if (!is_in_haze_bounding_volume(pos_start, total_probe_dist, DISK_OUTER)) {
+        return ray_dir_in;
+    }
+
+    // mod(iTime, 1000.0) without relying on WGSL %-on-f32 behaviour
+    let haze_time = u.iTime - floor(u.iTime / 1000.0) * 1000.0;
+
+    var accumulated_force = vec3<f32>(0.0);
+    var total_weight = 0.0;
+    for (var i = 0; i < HAZE_PROBE_STEPS; i += 1) {
+        let march_dist = f32(i + 1) * HAZE_STEP_SIZE;
+        let probe_pos = pos_start + ray_dir_norm * march_dist;
+        let t = f32(i + 1) / f32(HAZE_PROBE_STEPS);
+        let weight = min(min(3.0 * t, 1.0), 3.05 - 3.0 * t);
+        let f = get_haze_force(probe_pos, haze_time, PHYS_A, PHYS_Q,
+                               DISK_INNER, DISK_OUTER, DISK_THIN, DISK_HOPPER,
+                               ACCRETION_RATE);
+        accumulated_force += f * weight;
+        total_weight += weight;
+    }
+
+    let avg_force = accumulated_force / max(0.001, total_weight);
+    if (dot(avg_force, avg_force) > 1e-10) {
+        let force_perp = avg_force - dot(avg_force, ray_dir_norm) * ray_dir_norm;
+        let deflection = force_perp * HAZE_STRENGTH * 25.0;
+        return normalize(ray_dir_in + deflection * 0.1);
+    }
+    return ray_dir_in;
 }
 
 // ---- Section 15: Accretion Disk (per-point sampler, matching GLSL DiskColor) ----
@@ -803,14 +1050,22 @@ fn mainImage(frag_coord: vec2<f32>) -> vec4<f32> {
         cam_up = normalize(cross(cam_right, fwd));
     }
 
-    let pixel_jitter = vec2<f32>(
+    // Sub-pixel jitter in raw pixel units, matching GLSL
+    //   Jitter = vec2(Random, Random) / Resolution; FragUv += 0.25 * Jitter
+    let jitter_raw = vec2<f32>(
         random_step(uv, fract(u.iTime + 0.5)),
         random_step(uv, fract(u.iTime))
-    ) / res;
+    );
     let cam_back = normalize(cross(cam_right, cam_up));
     let cam_fwd = -cam_back;
-    let pixel_uv = (frag_coord + 0.5 * pixel_jitter - 0.5 * res) / res.y;
-    let ray_dir = normalize(cam_fwd + fov * (pixel_uv.x * cam_right + pixel_uv.y * cam_up));
+    // FragUvToDir convention: horizontal FOV = FOV_RAD regardless of aspect,
+    // vertical FOV scales by resY/resX. The prior port anchored to y instead,
+    // which inflated horizontal FOV on ultrawide frames and pushed the subject
+    // off-center.
+    let frag_uv = (frag_coord + 0.25 * jitter_raw) / res;
+    let local_x = fov * (2.0 * frag_uv.x - 1.0);
+    let local_y = fov * (2.0 * frag_uv.y - 1.0) * res.y / res.x;
+    var ray_dir = normalize(cam_fwd + local_x * cam_right + local_y * cam_up);
 
     // Event horizon
     let h_disc = MASS * MASS - PHYS_A * PHYS_A - PHYS_Q * PHYS_Q;
@@ -819,22 +1074,9 @@ fn mainImage(frag_coord: vec2<f32>) -> vec4<f32> {
     if (h_disc >= 0.0) { evt_r = MASS + sqrt(h_disc); }
     else { naked = true; }
 
-    // Initialize ray
-    var st: GState;
-    st.X = vec4<f32>(cam_pos, 0.0);
-    st.P = init_momentum(ray_dir, st.X, PHYS_A, PHYS_Q, uni_s);
-    let E_cons = -st.P.w;
-
-    var result = vec4<f32>(0.0);
-    var hit_h = false;
-    var escaped_bg = false;
-    var last_r = kerr_schild_r(cam_pos, PHYS_A, 1.0);
-    var shell_depth = 0.0;
-    var ray_dir_cur = ray_dir;
-    var last_dr = 0.0;
-    var turn_count = 0;
-
-    // Bounding sphere skip
+    // Bounding sphere skip (before momentum init — advance camera position if
+    // the cam starts far outside the simulation volume).
+    var cam_pos_eff = cam_pos;
     let cam_dist = length(cam_pos);
     let boundary = max(DISK_OUTER + 1.0, 501.0);
     if (cam_dist > boundary) {
@@ -846,12 +1088,28 @@ fn mainImage(frag_coord: vec2<f32>) -> vec4<f32> {
         }
         let t_enter = -b - sqrt(max(delta, 0.0));
         if (t_enter > 0.0) {
-            // Advance ray to bounding sphere
-            // We can't modify X directly in init, so we re-init after moving
-            st.X = vec4<f32>(cam_pos + ray_dir * t_enter * 0.99, 0.0);
-            st.P = init_momentum(ray_dir, st.X, PHYS_A, PHYS_Q, uni_s);
+            cam_pos_eff = cam_pos + ray_dir * t_enter * 0.99;
         }
     }
+
+    // Heat-haze refraction: deflect ray_dir based on a rotating noise field
+    // around disk + jets, before momentum init. Port of ENABLE_HEAT_HAZE path.
+    ray_dir = apply_heat_haze(cam_pos_eff, ray_dir);
+
+    // Initialize ray state
+    var st: GState;
+    st.X = vec4<f32>(cam_pos_eff, 0.0);
+    st.P = init_momentum(ray_dir, st.X, PHYS_A, PHYS_Q, uni_s);
+    let E_cons = -st.P.w;
+
+    var result = vec4<f32>(0.0);
+    var hit_h = false;
+    var escaped_bg = false;
+    var last_r = kerr_schild_r(cam_pos_eff, PHYS_A, 1.0);
+    var shell_depth = 0.0;
+    var ray_dir_cur = ray_dir;
+    var last_dr = 0.0;
+    var turn_count = 0;
 
     // Jitter for anti-aliasing and disk sub-stepping phase
     let jitter = random_step(uv, fract(u.iTime));
@@ -1043,16 +1301,39 @@ fn mainImage(frag_coord: vec2<f32>) -> vec4<f32> {
         );
     }
 
-    // NaN protection
-    if (!(final_color.x == final_color.x) || !(final_color.y == final_color.y) || !(final_color.z == final_color.z)) {
+    // NaN protection (pre tone-map). Check all 4 components; alpha can also
+    // carry NaN into the history buffer and contaminate future frames.
+    if (any(final_color != final_color)) {
         final_color = 0.5 * sample_bg(ray_dir, current_shift, current_status);
+        // sample_bg itself can return NaN if freq_shift math blows up; force-clean.
+        if (any(final_color != final_color)) { final_color = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     }
 
     final_color = apply_tone_mapping(final_color, current_shift);
 
+    // apply_tone_mapping uses pow(); a negative input would produce NaN that
+    // bypasses the pre-map guard. Scrub again before writing to history.
+    if (any(final_color != final_color)) { final_color = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+
+    // TAA history blend (Buffer A self-feedback). GLSL reference uses
+    // texelFetch with integer coords — exact-texel lookup, no bilinear
+    // filtering. Using stSample here instead creates a soft half-pixel
+    // re-filter per frame; with a 50/50 blend that compounds into visible
+    // horizontal/vertical streaks when the camera moves in smaller windows
+    // (the history "smears" along the motion vector). Switch to texelFetch
+    // for a frame-stable feedback path.
     if (u.iFrame > 0) {
-        let prev = stSample(iChannel3, uv);
+        var prev = stTexelFetch(iChannel3, vec2<i32>(frag_coord));
+        // If ANY frame ever wrote NaN to this history buffer (pre-guard build,
+        // or edge case that slipped through), a 50/50 blend preserves it
+        // forever: 0.5*clean + 0.5*NaN = NaN. The contaminated pixels then
+        // flicker as downstream pow() produces undefined values, showing up
+        // as bright specks and (when aligned with bloom atlas sampling)
+        // regular-interval vertical streaks in the final image. Scrub here.
+        if (any(prev != prev)) { prev = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
         final_color = 0.5 * final_color + 0.5 * prev;
+        // Final safety: blend can still yield NaN if either side is Inf.
+        if (any(final_color != final_color)) { final_color = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     }
 
     return final_color;
@@ -1423,7 +1704,17 @@ fn BicubicTexture(tex: texture_2d<f32>, coord_in: vec2<f32>) -> vec4<f32> {
 
   let sx = s.x / (s.x + s.y);
   let sy = s.z / (s.z + s.w);
-  return mix(mix(sample3, sample2, sx), mix(sample1, sample0, sx), sy);
+  var result = mix(mix(sample3, sample2, sx), mix(sample1, sample0, sx), sy);
+  // Clamp to non-negative: the cubic spline weights include negative lobes
+  // and at sharp edges in the bloom atlas (zero ↔ bright boundaries at
+  // octave tile seams) this can yield small negative components. Downstream
+  // pow() in tone mapping turns those into NaN, which after TAA feedback
+  // becomes a persistent vertical streak artifact at the screen-space
+  // projection of each atlas seam. Clamp at the source.
+  result = max(result, vec4<f32>(0.0));
+  // max() with NaN is implementation-defined on some GPUs. Explicit scrub.
+  if (any(result != result)) { result = vec4<f32>(0.0); }
+  return result;
 }
 
 fn ColorFetchImage(coord: vec2<f32>) -> vec3<f32> {
@@ -1464,8 +1755,22 @@ fn GetBloom(coord: vec2<f32>) -> vec3<f32> {
 
 fn mainImage(fragCoord: vec2<f32>) -> vec4<f32> {
   let uv = fragCoord / u.iResolution.xy;
-  var color = ColorFetchImage(uv);
-  color += GetBloom(uv) * 0.08;
+  var base = ColorFetchImage(uv);
+  // Scrub NaN from the Buffer A read before it contaminates the bloom add.
+  if (any(base != base)) { base = vec3<f32>(0.0); }
+
+  var bloom = GetBloom(uv) * 0.08;
+  if (any(bloom != bloom)) { bloom = vec3<f32>(0.0); }
+
+  var color = base + bloom;
+
+  // BicubicTexture can yield slightly negative components at strong edges
+  // (the cubic weights include negative lobes). pow(negative, ...) = NaN,
+  // which then propagates through every subsequent tone-map step and
+  // shows up as flickering bright specks. Clamp to zero first.
+  color = max(color, vec3<f32>(0.0));
+  // max() with NaN is implementation-defined; explicit check is required.
+  if (any(color != color)) { color = vec3<f32>(0.0); }
 
   color = pow(color, vec3<f32>(1.5));
   color = color / (vec3<f32>(1.0) + color);
@@ -1475,6 +1780,9 @@ fn mainImage(fragCoord: vec2<f32>) -> vec4<f32> {
   color = pow(color, vec3<f32>(1.3, 1.20, 1.0));
   color = saturateImage(color * 1.01);
   color = pow(color, vec3<f32>(0.7 / 2.2));
+
+  // Final defensive scrub: prevent any stray NaN from reaching the screen.
+  if (any(color != color)) { color = vec3<f32>(0.0); }
 
   return vec4<f32>(color, 1.0);
 }

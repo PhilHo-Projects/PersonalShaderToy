@@ -1,110 +1,97 @@
-# PersonalShaderToy Desktop Roadmap
+# PersonalShaderToy Roadmap
 
 ## Summary
 
-- Build this as a `Tauri UI + Rust native renderer sidecar` desktop tool, not as a pure web renderer inside the webview.
-- Phase 1 cleans and modularizes the current web app so the UI/domain/services layer can be shared by browser dev mode and the future Tauri desktop shell.
-- The first product goal is a generic shader lab: import/edit shaders, switch preview backend, inspect diagnostics/FPS, and learn how the APIs differ.
-- Browser-only mode remains supported during the migration.
+- The primary target is now a standalone Rust desktop shader lab built in one native window with `winit + egui + wgpu`.
+- We are no longer optimizing for `Tauri UI + separate native preview sidecar`; that path has been removed from the working tree.
+- The immediate goal is a reliable native playground for loading, authoring, translating, and previewing shaders, especially Shadertoy-style GLSL/WGSL content.
+- The current native UX direction is a split workflow inside the same window:
+  - `Load Shaders` for browsing, selecting, compiling, previewing, and diagnostics
+  - `Create Shader` for intentional editing with explicit `Compile` and `Save`
+- A separate standalone browser app remains in the repo under `apps/web/`, but it is not the main product direction.
 
 ## Delivery Phases
 
 ### Phase 0: Documentation and repo hygiene
 
-- Create canonical root `CLAUDE.md` and mirrored root `AGENTS.md`.
-- Create root `TIMELINE.md` as the current-phase tracker.
-- Extend `.gitignore` for Tauri, Rust, and sidecar artifacts.
-- Keep this document as the decision log and implementation guide.
+- Keep `CLAUDE.md`, `AGENTS.md`, `ROADMAP.md`, and `TIMELINE.md` aligned with the current standalone-Rust direction.
+- Make the active entrypoints and shelved experiments obvious to future contributors.
 
-### Phase 1: Stabilize and modularize the browser app
+### Phase 1: Browser/Tauri exploration (completed)
 
-- Separate `ShaderLanguage`, `PreviewRuntime`, and `PreviewBackend` in the frontend state model.
-- Introduce transport-neutral app concerns:
-  - shader documents and session state
-  - preview config
-  - preview diagnostics/stats/capabilities
-  - shader library state
-- Move browser-specific file loading and watching behind services/interfaces.
-- Move preview orchestration behind a `PreviewHost` abstraction while keeping browser preview fully functional.
-- Preserve existing editing flow and most existing UI components.
+- The repo retains a standalone browser app in `apps/web/` as a separate surface that shares only the root `shaders/` directory.
+- The old Tauri shell and native sidecar path are no longer part of the repository layout.
 
-### Phase 2: Bootstrap the Tauri shell
+### Phase 2: Standalone Rust desktop foundation
 
-- Add a Tauri v2 shell around the existing frontend.
-- Replace browser-only file-system assumptions with Tauri commands/events behind the `ShaderLibraryService`.
-- Keep browser dev mode available for fast frontend iteration.
-- Add local settings persistence and sidecar lifecycle scaffolding.
+- Build a root Rust application that owns:
+  - the window shell
+  - the preview surface
+  - file browsing/loading
+  - the authoring surface
+  - diagnostics and stats
+- Keep the first-party UX intentionally utilitarian if that helps us move faster on shader functionality.
 
-### Phase 3: Add the native preview sidecar
+### Phase 3: Shader-lab stabilization
 
-- Create a Rust sidecar using `wgpu` + `winit`.
-- Scope the initial sidecar to:
-  - native preview window
-  - single-pass WGSL
-  - backend capability detection
-  - FPS and compile diagnostics telemetry
-- Establish a minimal UI-to-sidecar protocol for:
-  - startup handshake
-  - backend/config updates
-  - document load/update
-  - telemetry and lifecycle events
-
-### Phase 4: Tauri <-> sidecar integration
-
-- Let Tauri own sidecar process startup/shutdown and crash recovery.
-- Route preview controls through the desktop shell.
-- Surface native telemetry, adapter details, and backend availability in the UI.
-- Keep browser preview available as a fallback until native parity is acceptable.
-
-### Phase 5: Shader-lab parity and education features
-
-- Grow native preview support for:
-  - shared uniforms and input
-  - texture channels
+- Improve native support for:
+  - WGSL single-pass shaders
+  - GLSL-to-WGSL translation for Shadertoy-style imports
   - multipass/ping-pong rendering
-  - screenshots
-  - file reloads
-- Add normalized import/document metadata and translation diagnostics.
-- Treat translation as a managed subsystem rather than ad hoc editing.
-- Add educational surfaces for backend capabilities and runtime differences.
+  - backend visibility and FPS realism
+  - screenshots and basic workflow quality
+- Prefer compatibility preprocessing and actionable diagnostics over opaque compiler failures.
+- Keep large previewed shaders out of any always-live editing path so workflow features do not dominate shader load cost.
+- For visual bugs, prove the native host path with small diagnostic shaders before blaming large ports. `shaders/Test/test5.wgsl` is the current multipass centering/feedback fixture.
 
-### Phase 6: Engine integration
+### Phase 4: Workflow improvements
 
-- Defer Unity/Unreal export until the lab is stable.
-- Introduce a constrained intermediate material/export model rather than exporting arbitrary shader text directly.
-- Start with safe-subset exports and explicit validation failures when unsupported constructs are present.
+- Add the small quality-of-life features that help the lab feel reliable:
+  - better diagnostics filtering
+  - less noisy logs
+  - cleaner shader browsing/loading behavior
+  - explicit separation between previewing and authoring
+  - dynamic preview sizing with fixed display aspect plus render scale
+  - lightweight persistence where it helps iteration
 
-## Core Interfaces
+### Phase 5: Engine export
 
-- `ShaderLanguage = 'glsl' | 'wgsl' | 'hlsl'`
-- `PreviewRuntime = 'browser' | 'native'`
-- `PreviewBackend = 'auto' | 'webgl2' | 'webgpu' | 'dx12' | 'vulkan' | 'metal' | 'opengl'`
-- `PreviewConfig`
-- `PreviewStats`
-- `PreviewCapabilities`
-- `PreviewDiagnostic`
-- `ShaderLibraryService`
-- `PreviewHost`
-- `SettingsStore`
+- Continue to defer engine export until the standalone shader lab is stable.
+- When export work starts, prefer a constrained intermediate representation and explicit validation over raw text dumping.
 
 ## Current Decisions
 
-- The native preview should be a separate sidecar window/process.
-- Monaco stays in place for now.
-- The first native preview can be visually minimal.
-- Engine export is not part of the first desktop milestone.
-- Browser mode should remain a supported migration path throughout the early phases.
+- The renderer and the editor should live in the same native app window.
+- A second preview window is not part of the current plan.
+- Loaded shaders should be preview-only in `Load Shaders`; editing should be intentional in `Create Shader`.
+- Authoring should use explicit `Compile` and `Save`, not live recompilation on every text change.
+- A fancy editor is optional; shader workflow reliability matters more.
+- The standalone browser app should not drive native-app architecture decisions unless we intentionally choose to borrow from it.
+- Engine export is still out of scope for the current stage.
+- Native multipass passes must keep pass-local render state. In particular, each compiled pass owns its own uniform buffer so earlier offscreen passes cannot accidentally observe Image-pass viewport uniforms at GPU execution time.
+- Remaining Kerr-Newman work is now mostly shader parity and visual-baseline work, not the previously observed native host centering drift.
 
-## Implemented Foundation
+## Implemented / Existing Paths
 
-- Root project instructions and status docs now live at the repo root.
-- Browser app state now distinguishes shader language from preview backend/runtime.
-- Browser file access is routed through `ShaderLibraryService`.
-- Browser preview orchestration is routed through `PreviewHost`.
-- Tauri v2 shell scaffolding is present and validated with a debug build.
-- Native preview sidecar scaffolding exists under `native/preview-sidecar` with a minimal JSON command/event protocol.
-- Tauri commands (`spawn_preview_sidecar`, `send_preview_command`, `stop_preview_sidecar`) manage the sidecar process lifecycle.
-- `TauriNativePreviewBridge` relays commands/events between the frontend and the sidecar via Tauri invoke/listen.
-- `NativePreviewHost` implements `PreviewHost` for the native sidecar, handling stats, diagnostics, and compile status.
-- `main.ts` swaps between `BrowserPreviewHost` and `NativePreviewHost` based on the selected backend and Tauri runtime detection.
-- Native backends (DX12, Vulkan, Metal, OpenGL) are enabled in the toolbar backend selector when running in Tauri mode.
+- The active native app lives at the repo root in `Cargo.toml` + `src/main.rs`.
+- The standalone browser app lives in `apps/web/`.
+- Both product surfaces share the root `shaders/` directory, but their rendering/runtime stacks are intentionally separate.
+- Native authored shaders default to `shaders/User/`.
+- The native app now uses split workspaces:
+  - `Load Shaders` for preview/logs/backend info and shader selection
+  - `Create Shader` for creating or intentionally opening source files in a plain editor
+- The native preview now sizes rendering from the actual viewport with:
+  - `Display Aspect`: `Auto`, `16:9`, `4:3`, `1:1`
+  - `Render Scale`: `0.5x`, `0.75x`, `1.0x`
+- Native multipass rendering now uses per-pass uniform buffers, which fixed the sampled-buffer drift exposed by `shaders/Test/test5.wgsl`.
+- Native screenshots can be requested through the existing `TakeScreenshot`/`ScreenshotTaken` command path and are written under `target/native-captures/`.
+
+## Recent Decision Log
+
+### 2026-04-24
+
+- Keep both surfaces:
+  - the root Rust native app remains the primary product direction
+  - the web app under `apps/web/` remains a separate runnable reference/experimental surface
+- Treat `test5.wgsl` as the cheap centering oracle before opening Kerr-Newman-sized shaders.
+- The two-week native framing investigation resolved to a host multipass uniform lifetime bug: shared uniforms were overwritten before submitted GPU work consumed them. This is now fixed with per-pass uniform buffers.

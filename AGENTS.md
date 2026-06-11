@@ -4,28 +4,46 @@ This file mirrors `CLAUDE.md`. Keep both files synchronized.
 
 ## Product Direction
 
-- The long-term architecture is `Tauri UI + Rust native renderer sidecar`.
-- The browser app remains a supported development mode during migration.
-- Early milestones prioritize:
-  - modular frontend architecture
-  - backend/runtime switching
-  - preview diagnostics and FPS realism
-  - safe shader-lab workflows
-- Engine export is intentionally deferred until the generic shader lab is stable.
+- The active product direction is a standalone Rust desktop shader lab built around `winit + egui + wgpu`.
+- The editor UI and the shader preview live in the same native window. We are not currently targeting a `Tauri shell + separate sidecar preview window`.
+- Inside that one window, previewing and authoring are now intentionally split into `Load Shaders` and `Create Shader`.
+- The standalone browser app stays in the repo as a separate product surface for reference and experimentation, but it is not the primary architecture target.
+- Early priorities are:
+  - stable shader loading and file browsing in the native app
+  - practical GLSL/WGSL workflows, including Shadertoy-style imports
+  - useful diagnostics without noisy debug spam
+  - safe shader-lab iteration with explicit compile/save authoring flow before polishing editor UX
+- Engine export is intentionally deferred until the standalone shader lab is reliable.
 
 ## Implementation Priorities
 
-1. Keep the current browser app functional while extracting reusable services and state.
-2. Separate shader language from preview backend/runtime in the frontend model.
-3. Move file access and preview orchestration behind replaceable adapters.
-4. Use Tauri for desktop shell concerns, not as the primary graphics backend.
-5. Keep the native preview intentionally minimal until backend switching and telemetry are solid.
+1. Keep the standalone Rust app in `Cargo.toml` + `src/main.rs` functional while we iterate.
+2. Improve GLSL/WGSL compatibility and multipass behavior in the native pipeline.
+3. Treat the integrated native window as the only preview surface unless we explicitly decide otherwise later.
+4. Use the browser/Tauri code as reference or fallback only; do not let it drive new architecture decisions by default.
+5. Prefer reliable diagnostics and workflow clarity over editor polish.
+6. Keep loaded-shader previewing separate from intentional source editing whenever that reduces heavy-shader UI overhead.
+7. For native visual bugs, validate host geometry, uniforms, target sizes, and pass feedback with small diagnostic shaders before opening giant shader ports.
 
 ## Repo Conventions
 
 - Root planning/status docs:
   - `ROADMAP.md` is the implementation plan and decision log.
   - `TIMELINE.md` is the current implementation tracker.
+- Fast navigation docs:
+  - `docs/PROJECT_MAP.md` is the cheapest repo entry map.
+  - `docs/SHADER_INDEX.md` is the shader routing/index file.
+  - `docs/WORKING_RULES.md` is the context-discipline guide.
 - `AGENTS.md` must stay in sync with this file.
-- Browser-only code should remain runnable throughout the migration.
-- Avoid tying new app logic directly to DOM, fetch, or WebSocket globals when an interface can isolate them.
+- The primary desktop entrypoint is the root Rust app (`Cargo.toml`, `src/main.rs`).
+- The standalone browser app lives in `apps/web/` and only shares the root `shaders/` directory with the Rust app.
+- Kerr-Newman reference materials live under `docs/kerr-newman-port/reference/` and `docs/kerr-newman-port/baselines/`.
+- `shaders/Test/test5.wgsl` is the current cheap multipass centering/feedback diagnostic.
+- Avoid coupling the Rust app and browser app beyond the shared shader corpus unless we explicitly choose to do so later.
+- Avoid opening giant shader files first when a manifest or index doc can route the task.
+
+## Recent Native Rendering Notes
+
+- On `2026-04-24`, the long-running native multipass centering issue was traced to a host-side uniform lifetime bug, not to `test5.wgsl` shader math.
+- Each compiled native multipass pass must own and bind its own uniform buffer. Reusing one shared `multi_uniform_buf` lets later Image-pass viewport uniforms overwrite earlier offscreen pass uniforms before the GPU executes the submitted command encoder.
+- After that fix, remaining Kerr-Newman work should be treated as shader parity/visual-baseline work unless a small diagnostic shader proves a host regression.

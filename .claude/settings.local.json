@@ -13,7 +13,9 @@
       "Bash(timeout 6 sleep 5)",
       "Bash(timeout 10 sleep 9)",
       "Bash(timeout 4 sleep 3)",
-      "Bash(timeout 12 sleep 11)"
+      "Bash(timeout 12 sleep 11)",
+      "Bash(cargo build:*)",
+      "Bash(taskkill /F /IM personal-shadertoy.exe)"
     ]
   }
 }

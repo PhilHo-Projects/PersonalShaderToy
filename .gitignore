@@ -5,10 +5,8 @@ dist/
 .codex-*
 .playwright-cli/
 target/
-src-tauri/target/
-src-tauri/gen/
-src-tauri/binaries/
-native/target/
 *.pdb
 *.ilk
 *.dSYM
+build_error.txt
+temp_err.txt

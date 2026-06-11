@@ -3,7 +3,7 @@
 ## Canonical Sources
 
 - Original multipass shader: `shaders/Shadertoy/kerr_newman_black_hole.glsl`
-- Split Buffer A reference: `FinalBoss/BufferA.txt`
+- Split Buffer A reference: `docs/kerr-newman-port/reference/FinalBoss/BufferA.txt`
 - Active WGSL target: `shaders/openai/kerr_newman_black_hole_multipass.wgsl`
 
 ## Pass Graph Lock
@@ -43,6 +43,7 @@
 | --- | --- | --- |
 | CRLF-safe multipass parsing | Done | `src/renderer/shaderParser.ts` normalizes line endings before pass parsing. |
 | Post stack parity (`Buffer B/C/D/Image`) | Done | Replaced with a more literal translation of the original post/bloom stack. |
+| Native multipass host centering | Done | `2026-04-24`: fixed Rust host pass-uniform lifetime bug. Each compiled pass now owns its own uniform buffer, resolving sampled-buffer drift exposed by `shaders/Test/test5.wgsl`. |
 | Buffer A camera/state from Buffer B | Done | `Buffer A` now reads camera basis and universe sign from `iChannel2: Buffer B`. |
 | Background + Buffer A tone-map chunk | In progress | Dense stars, spectral background shift, and pre-history tone map are now in; antiverse rain and frequency-shift plumbing still remain. |
 | Physics/core audit | Pending | Needs chunk-by-chunk mapping against original helpers. |
@@ -55,9 +56,10 @@
 
 ## Fresh-Chat Handoff
 
-- Treat `D:\PersonalShaderToy\shaders\Shadertoy\kerr_newman_black_hole.glsl` and `D:\PersonalShaderToy\FinalBoss\BufferA.txt` as the code oracle.
-- Treat `D:\PersonalShaderToy\output\playwright\original-kerr-baseline.png` as the visual oracle.
+- Treat `D:\PersonalShaderToy\shaders\Shadertoy\kerr_newman_black_hole.glsl` and `D:\PersonalShaderToy\docs\kerr-newman-port\reference\FinalBoss\BufferA.txt` as the code oracle.
+- Treat `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\original-kerr-baseline.png` as the visual oracle.
 - Do not rewrite the whole shader.
+- Do not chase native centering/framing by opening the giant shader first. Re-check `shaders/Test/test5.wgsl` if host drift is suspected.
 - Do not re-open already-fixed areas unless a direct dependency forces it:
 - stars/background density
 - event horizon / shell asymmetry

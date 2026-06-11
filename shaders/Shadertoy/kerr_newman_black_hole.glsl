@@ -3372,7 +3372,7 @@ void mainImage( out vec4 FragColor, in vec2 FragCoord )
     if(iFrame > 0) {
         PrevColor = texelFetch(iHistoryTex, ivec2(FragCoord.xy), 0);
     }
-    
+
     FragColor = (iBlendWeight) * FinalColor + (1.0 - iBlendWeight) * PrevColor;
 }
 //! PASS: Buffer B

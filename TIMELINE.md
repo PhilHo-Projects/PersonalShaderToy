@@ -2,52 +2,82 @@
 
 ## Current Phase
 
-- `Phase 3 / Phase 4 — sidecar integration`
+- `Phase 3 — Standalone Rust shader-lab stabilization`
 
 ## Phase Status
 
-- Documentation/bootstrap: `complete`
-- Browser modularization: `complete`
-- Tauri shell: `complete`
-- Native sidecar: `wired into Tauri shell`
-- Tauri <-> sidecar integration: `initial wiring complete`
+- Docs refresh for the post-Tauri direction: `complete`
+- Standalone native app (`winit + egui + wgpu`): `active`
+- Standalone browser app split into `apps/web`: `complete`
+- Integrated single-window native workflow split (`Load Shaders` + `Create Shader`): `complete`
+- Preview-only loading flow for large shaders: `complete`
+- Explicit create/edit flow with manual `Compile` and `Save`: `complete`
+- Dynamic preview sizing (`Display Aspect` + `Render Scale`): `complete`
+- Compile progress/status surfaced in the UI: `complete`
+- Compile-loop guard for preview-size churn: `complete`
+- Native multipass viewport/uniform stability: `fixed`
+- GLSL/WGSL translation and Shadertoy compatibility: `active work`
+- Tauri/sidecar path removal: `complete`
 - Engine export: `deferred`
 
 ## Exit Criteria For The Current Stage
 
-- Root `CLAUDE.md`, `AGENTS.md`, `ROADMAP.md`, and `TIMELINE.md` exist.
-- `.gitignore` covers the upcoming desktop/native artifacts.
-- Frontend state separates shader language from preview backend/runtime.
-- Browser file access and preview logic are behind replaceable interfaces.
-- Current browser workflow still builds and runs.
-- Tauri shell can build against the current frontend without the Express shader server.
-- Native preview sidecar is spawned from Tauri commands and communicates via stdin/stdout JSON.
-- Backend selector in desktop mode enables native backends (DX12, Vulkan, Metal, OpenGL).
-- Selecting a native backend spawns the sidecar, swaps the preview panel, and streams stats/diagnostics.
-- Switching back to a browser backend (WebGL2/WebGPU) stops the sidecar and restores browser preview.
+- Root docs describe the standalone Rust app as the active architecture.
+- The root native app can browse and load shaders without duplicate compile churn.
+- Large loaded shaders stay out of the live editor path unless intentionally opened in `Create Shader`.
+- WGSL shaders compile reliably in the integrated renderer.
+- Shadertoy-style GLSL imports work for more real-world samples, including large shaders that need preprocessing before naga translation.
+- Diagnostics stay useful without flooding the UI or stdout with low-signal noise.
 
 ## Next Milestone
 
-- End-to-end testing of the native preview path in a Tauri debug build.
-- Add crash recovery and auto-restart for the sidecar process.
-- Input forwarding (mouse/keyboard) from Tauri UI to sidecar window.
+- Re-check Kerr-Newman visual parity now that the native multipass host centering bug is fixed.
+- Keep hardening the native shader pipeline against real imported shaders.
+- Keep the standalone browser app usable without letting it drive native architecture choices.
+- Use `shaders/Test/test5.wgsl` as the first native multipass centering/feedback diagnostic before opening giant shader ports.
 
 ## Current Blockers / Watch Items
 
-- Sidecar binary path is resolved from the cargo build directory; production bundling is not yet configured.
-- Backend switching requires restarting the sidecar process (the current sidecar does not support runtime backend changes).
-- Native preview currently only accepts WGSL shaders; GLSL and HLSL require translation before sending to sidecar.
+- The repo still contains multiple architectural paths, so stale docs can easily send work in the wrong direction.
+- GLSL compatibility depends on our preprocessing layer working around naga limitations.
+- The browser app and Rust app now split cleanly, so shared-path assumptions should stay limited to the root `shaders/` corpus.
+- Heavy imported shaders can still be slow enough that we need to separate true shader cost from translation/build cost and dev-profile overhead.
+- Kerr-Newman still needs shader-level visual parity work, but the native host centering/resize artifact should no longer be treated as the primary suspect.
+- Automated native screenshot capture through stdin remains flaky in local harnesses even though the screenshot command path exists.
 
 ## Verified Milestones
 
-- `npm run build`
-- `cargo check` in `src-tauri/`
-- `cargo check` in `native/preview-sidecar/`
-- `npm run tauri:build -- --debug`
-- Git repo initialized with all Codex work committed.
+- Root standalone Rust app exists in `Cargo.toml` + `src/main.rs`.
+- Standalone browser app exists in `apps/web/`.
+- Integrated native window now separates previewing and authoring into `Load Shaders` and `Create Shader`.
+- `Create Shader` writes real files under `shaders/User/` and compiles only when requested.
+- Native preview resolution now comes from viewport size plus aspect/scale controls instead of the old fixed preset flow.
+- Native multipass render passes now use per-pass uniform buffers, fixing the sampled-buffer centering drift seen in `test5.wgsl`.
+- `shaders/Test/test5.wgsl` is now a compact multipass centering diagnostic for Buffer A/B/C/Image alignment.
+- `cargo check`
+- `cargo test`
+- `cargo run --bin test_parse_wgsl shaders/Test/test5.wgsl`
+- `cargo run --bin test_parse shaders/Shadertoy/kerr_newman_black_hole.glsl`
+
+## Journal
+
+### 2026-04-24 — Native multipass centering bug finally isolated
+
+- Symptom: `test5.wgsl` showed the final Image pass center marker in the correct place, while sampled Buffer A/B/C content was shifted right/down.
+- Diagnosis: the shader math was not the main issue. Native multipass rendering recorded all passes into one command encoder while reusing one shared `multi_uniform_buf`; the Image pass then overwrote viewport-origin uniforms before the GPU executed earlier buffer passes.
+- Fix: `CompiledPass` now owns a per-pass uniform buffer, and the render loop writes/binds `cp.uniform_buf` for that pass.
+- Result: host-side sampled-buffer drift is fixed. Any remaining Kerr-Newman mismatch should be investigated as shader parity, pass feedback, or visual baseline work rather than a generic native centering bug.
+- Verification run: `cargo check`, `cargo test`, `cargo run --bin test_parse_wgsl shaders/Test/test5.wgsl`, and `cargo run --bin test_parse shaders/Shadertoy/kerr_newman_black_hole.glsl`.
+
+### 2026-04-24 — Native resize/framing stabilization pass
+
+- Centralized preview geometry around the current egui viewport instead of stale stored rectangles.
+- Synchronized ping-pong target sizes with the active preview pixel size.
+- Reset temporal frame state on shader load, display-aspect/render-scale changes, and target resize.
+- Added screenshot readback helpers that save captures under `target/native-captures/`; local stdin automation still needs a more reliable harness.
 
 ## Notes
 
-- Browser mode remains the baseline verification environment while desktop mode is scaffolded.
-- Tauri and native preview work should not regress the existing shader editing workflow.
-- The sidecar is spawned via `std::process::Command` in Tauri Rust commands, not via the Tauri shell plugin JS API. This gives Tauri ownership of the process lifecycle.
+- The current product direction values one-window workflow clarity over editor polish.
+- The current native editor is intentionally plain and non-live so large previewed shaders do not pay for syntax/editor churn by default.
+- The browser app should be treated as a separate secondary surface, not as the default architecture template for the Rust app.

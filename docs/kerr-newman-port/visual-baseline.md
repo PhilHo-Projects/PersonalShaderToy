@@ -11,16 +11,17 @@
 
 ## Baseline Images
 
-- Original GLSL target: `D:\PersonalShaderToy\output\playwright\original-kerr-baseline.png`
-- WGSL after camera-state fix: `D:\PersonalShaderToy\output\playwright\openai-kerr-camera-state.png`
-- WGSL after background + Buffer A tone-map chunk: `D:\PersonalShaderToy\output\playwright\openai-kerr-background-tonemap.png`
-- WGSL after full disk-noise octaves: `D:\PersonalShaderToy\output\playwright\openai-kerr-disk-noise-fulloctaves.png`
-- WGSL after full disk sub-march: `D:\PersonalShaderToy\output\playwright\openai-kerr-disk-fullmarch.png`
-- WGSL after shell asymmetry + disk spin clamp: `D:\PersonalShaderToy\output\playwright\openai-kerr-shell-rotfact.png`
-- WGSL after original jet-visibility gate: `D:\PersonalShaderToy\output\playwright\openai-kerr-no-jets.png`
-- WGSL after background status/shift parity: `D:\PersonalShaderToy\output\playwright\openai-kerr-bg-status-shift.png`
-- WGSL after background escape-direction parity: `D:\PersonalShaderToy\output\playwright\openai-kerr-bg-raydir-reset.png`
-- WGSL after inner-cloud `SamplePos.zx` parity: `D:\PersonalShaderToy\output\playwright\openai-kerr-innercloud-zx.png`
+- Original GLSL target: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\original-kerr-baseline.png`
+- WGSL after camera-state fix: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-camera-state.png`
+- WGSL after background + Buffer A tone-map chunk: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-background-tonemap.png`
+- WGSL after full disk-noise octaves: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-disk-noise-fulloctaves.png`
+- WGSL after full disk sub-march: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-disk-fullmarch.png`
+- WGSL after shell asymmetry + disk spin clamp: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-shell-rotfact.png`
+- WGSL after original jet-visibility gate: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-no-jets.png`
+- WGSL after background status/shift parity: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-bg-status-shift.png`
+- WGSL after background escape-direction parity: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-bg-raydir-reset.png`
+- WGSL after inner-cloud `SamplePos.zx` parity: `D:\PersonalShaderToy\docs\kerr-newman-port\baselines\openai-kerr-innercloud-zx.png`
+- Native host centering diagnostic: `shaders/Test/test5.wgsl`
 
 ## Milestone Notes
 
@@ -92,6 +93,15 @@
 - The inner-cloud angular frame now matches the original (`SamplePos.zx` rather than `SamplePos.xz`), and the dust-thickness denominator now follows the GLSL more literally.
 - After these fixes, the remaining bright left patch appears to be the last meaningful visual mismatch and is no longer explained by an obvious port typo in the final background/dust handoff.
 
+### Native host centering fix
+
+- Date: `2026-04-24`
+- Diagnostic shader: `shaders/Test/test5.wgsl`
+- Symptom: the final Image-pass center marker was correct, but sampled Buffer A/B/C content drifted right/down.
+- Cause: the Rust native multipass renderer reused one shared uniform buffer for all passes; Image-pass viewport uniforms could overwrite earlier offscreen pass uniforms before submitted GPU work executed.
+- Fix: each compiled native multipass pass now owns and binds its own uniform buffer.
+- Effect on Kerr-Newman work: remaining differences should be investigated as shader parity or visual-baseline mismatches unless `test5.wgsl` shows host drift again.
+
 ## Chunk Verdicts
 
 | Chunk | Result | Notes |
@@ -106,6 +116,7 @@
 | Background status + shift parity | Positive | Removed false sky contribution from non-escaped rays and restored original-style `FreqShift` use. |
 | Background escape-direction parity | Neutral-to-positive | Corrected the code path to match the GLSL's `RayDir` handoff for background lookup. |
 | Inner-cloud `SamplePos.zx` parity | Neutral-to-positive | Fixed an exact angular-frame mismatch in the inner-cloud dust path. |
+| Native multipass host centering | Positive | Fixed sampled-buffer drift by replacing shared multipass uniforms with per-pass uniform buffers in the Rust host. |
 
 ## Next Visual Sign-Off Targets
 
