@@ -26,6 +26,9 @@ use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State as EguiWinitState;
 
 mod bench;
+mod render_settings;
+
+use render_settings::BackendChoice;
 
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const DEFAULT_WINDOW_WIDTH: u32 = 1600;
@@ -319,96 +322,6 @@ struct MultiPassUniforms {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Protocol types
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum BackendChoice {
-    Auto,
-    Dx12,
-    Vulkan,
-    Metal,
-    Opengl,
-}
-
-impl BackendChoice {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::Dx12 => "DirectX 12",
-            Self::Vulkan => "Vulkan",
-            Self::Metal => "Metal",
-            Self::Opengl => "OpenGL",
-        }
-    }
-
-    /// Backends that make sense to surface in the UI on the current platform.
-    fn ui_choices() -> &'static [Self] {
-        #[cfg(target_os = "windows")]
-        {
-            &[Self::Auto, Self::Dx12, Self::Vulkan, Self::Opengl]
-        }
-        #[cfg(target_os = "macos")]
-        {
-            &[Self::Auto, Self::Metal, Self::Vulkan]
-        }
-        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-        {
-            &[Self::Auto, Self::Vulkan, Self::Opengl]
-        }
-    }
-
-    fn parse(value: Option<&str>) -> Self {
-        match value.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("auto") => Self::Auto,
-            Some("dx12") => Self::Dx12,
-            Some("vulkan") => Self::Vulkan,
-            Some("metal") => Self::Metal,
-            Some("opengl" | "gl") => Self::Opengl,
-            _ => Self::Auto,
-        }
-    }
-
-    fn to_wgpu(self) -> wgpu::Backends {
-        match self {
-            Self::Auto => wgpu::Backends::all(),
-            Self::Dx12 => wgpu::Backends::DX12,
-            Self::Vulkan => wgpu::Backends::VULKAN,
-            Self::Metal => wgpu::Backends::METAL,
-            Self::Opengl => wgpu::Backends::GL,
-        }
-    }
-
-    fn preferred_backend_order(self) -> &'static [wgpu::Backend] {
-        match self {
-            Self::Dx12 => &[wgpu::Backend::Dx12],
-            Self::Vulkan => &[wgpu::Backend::Vulkan],
-            Self::Metal => &[wgpu::Backend::Metal],
-            Self::Opengl => &[wgpu::Backend::Gl],
-            Self::Auto => {
-                #[cfg(target_os = "windows")]
-                {
-                    &[
-                        wgpu::Backend::Dx12,
-                        wgpu::Backend::Vulkan,
-                        wgpu::Backend::Gl,
-                    ]
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    &[
-                        wgpu::Backend::Metal,
-                        wgpu::Backend::Vulkan,
-                        wgpu::Backend::Gl,
-                    ]
-                }
-                #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-                {
-                    &[wgpu::Backend::Vulkan, wgpu::Backend::Gl]
-                }
-            }
-        }
-    }
-}
 
 #[allow(dead_code)]
 #[derive(serde::Serialize)]
