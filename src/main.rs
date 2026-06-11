@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -644,7 +644,7 @@ struct RendererState {
 struct PreviewApp {
     workspace_mode: WorkspaceMode,
     create_view: CreateShaderView,
-    requested_backend: BackendChoice,
+    settings: render_settings::RenderSettings,
     shader_source: String,
     shader_language: ShaderInputLanguage,
     loaded_shader_name: String,
@@ -693,9 +693,19 @@ struct PreviewApp {
     compile_update_rx: Receiver<CompileUpdate>,
     active_compile: Option<ActiveCompile>,
     next_compile_job_id: u64,
-    /// Backend swap requested by UI; applied on the next RedrawRequested before
-    /// rendering, since we need access to `&ActiveEventLoop`.
-    pending_backend_change: Option<BackendChoice>,
+    /// Renderer rebuild requested by UI or benchmark; applied on the next
+    /// RedrawRequested before rendering, since we need `&ActiveEventLoop`.
+    pending_rebuild: Option<render_settings::RenderSettings>,
+    /// Adapter names (surface-compatible) discovered for the current backend.
+    available_adapters: Vec<String>,
+    /// Present modes the current surface supports.
+    supported_present_modes: Vec<wgpu::PresentMode>,
+    /// Present mode actually in use after fallback resolution.
+    active_present_mode: wgpu::PresentMode,
+    /// Set when present mode / frame latency changed and the surface needs reconfigure.
+    surface_reconfigure_needed: bool,
+    /// (pass name, milliseconds) for the most recent pipeline build.
+    pipeline_compile_ms: Vec<(String, f64)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1019,7 +1029,10 @@ struct ActiveCompile {
 }
 
 impl PreviewApp {
-    fn new(requested_backend: BackendChoice, commands: Receiver<SidecarCommand>) -> Self {
+    fn new(
+        initial_settings: render_settings::RenderSettings,
+        commands: Receiver<SidecarCommand>,
+    ) -> Self {
         let (shader_watch_tx, shader_watch_rx) = mpsc::channel();
         let (compile_update_tx, compile_update_rx) = mpsc::channel();
         let multipass_diag_enabled = std::env::var_os("PST_MULTIPASS_DIAG").is_some();
@@ -1046,7 +1059,7 @@ impl PreviewApp {
         Self {
             workspace_mode: WorkspaceMode::LoadShaders,
             create_view: CreateShaderView::Landing,
-            requested_backend,
+            settings: initial_settings,
             shader_source: DEFAULT_SHADER.to_string(),
             shader_language: ShaderInputLanguage::Wgsl,
             loaded_shader_name: "Built-in default".to_string(),
@@ -1099,7 +1112,12 @@ impl PreviewApp {
             compile_update_rx,
             active_compile: None,
             next_compile_job_id: 0,
-            pending_backend_change: None,
+            pending_rebuild: None,
+            available_adapters: Vec::new(),
+            supported_present_modes: Vec::new(),
+            active_present_mode: wgpu::PresentMode::Fifo,
+            surface_reconfigure_needed: false,
+            pipeline_compile_ms: Vec::new(),
         }
     }
 
@@ -1323,19 +1341,44 @@ impl PreviewApp {
         };
 
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        let requested_backends = self.requested_backend.to_wgpu();
+        let requested_backends = self.settings.backend.to_wgpu();
         instance_desc.backends = requested_backends;
+        instance_desc.backend_options.dx12.shader_compiler = self.settings.dx12_compiler.to_wgpu();
         let instance = wgpu::Instance::new(instance_desc);
 
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| e.to_string())?;
         let mut adapters = pollster::block_on(instance.enumerate_adapters(requested_backends));
-        let preferred_order = self.requested_backend.preferred_backend_order();
-        let preferred_index = preferred_order.iter().find_map(|preferred_backend| {
+        self.available_adapters = adapters
+            .iter()
+            .filter(|adapter| adapter.is_surface_supported(&surface))
+            .map(|adapter| adapter.get_info().name)
+            .collect();
+        self.available_adapters.dedup();
+
+        // Explicit adapter request by name takes priority over backend order.
+        let named_index = self.settings.adapter_name.as_ref().and_then(|wanted| {
             adapters.iter().position(|adapter| {
-                adapter.is_surface_supported(&surface)
-                    && adapter.get_info().backend == *preferred_backend
+                adapter.is_surface_supported(&surface) && adapter.get_info().name == *wanted
+            })
+        });
+        if self.settings.adapter_name.is_some() && named_index.is_none() {
+            self.push_diagnostic(
+                DiagLevel::Warning,
+                format!(
+                    "Adapter '{}' not found on this backend; using automatic selection.",
+                    self.settings.adapter_name.as_deref().unwrap_or_default()
+                ),
+            );
+        }
+        let preferred_order = self.settings.backend.preferred_backend_order();
+        let preferred_index = named_index.or_else(|| {
+            preferred_order.iter().find_map(|preferred_backend| {
+                adapters.iter().position(|adapter| {
+                    adapter.is_surface_supported(&surface)
+                        && adapter.get_info().backend == *preferred_backend
+                })
             })
         });
         let adapter = if let Some(index) = preferred_index {
@@ -1350,9 +1393,15 @@ impl PreviewApp {
         };
 
         let adapter_info = adapter.get_info();
+        // GPU pass timing needs timestamp queries; request them only when the
+        // adapter offers them (GL typically does not).
+        let mut required_features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("personal-shadertoy-device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             experimental_features: Default::default(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -1375,16 +1424,20 @@ impl PreviewApp {
             .find(|mode| *mode == wgpu::CompositeAlphaMode::Opaque)
             .unwrap_or(capabilities.alpha_modes[0]);
 
+        self.supported_present_modes = capabilities.present_modes.clone();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            present_mode: self
+                .settings
+                .resolve_present_mode(&capabilities.present_modes),
+            desired_maximum_frame_latency: self.settings.frame_latency,
             alpha_mode,
             view_formats: vec![],
         };
+        self.active_present_mode = config.present_mode;
         surface.configure(&device, &config);
 
         // ── Single-pass layout (1 uniform buffer) ──
@@ -1967,8 +2020,10 @@ impl PreviewApp {
             return Ok(());
         };
 
+        let pipeline_start = Instant::now();
         match create_pipeline(&r.device, r.config.format, &r.single_pl, source) {
             Ok(pipeline) => {
+                let compile_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
                 let bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("single-bg"),
                     layout: &r.single_bgl,
@@ -1978,6 +2033,11 @@ impl PreviewApp {
                     }],
                 });
                 r.mode = ShaderMode::Single(pipeline, bind_group);
+                self.pipeline_compile_ms = vec![("Image".to_string(), compile_ms)];
+                self.push_diagnostic(
+                    DiagLevel::Info,
+                    format!("Pipeline built in {compile_ms:.1} ms."),
+                );
                 self.total_frames = 0;
                 self.temporal_reset_pending = true;
                 Ok(())
@@ -2006,6 +2066,7 @@ impl PreviewApp {
             );
         }
 
+        let mut compile_times: Vec<(String, f64)> = Vec::new();
         for p in parsed {
             let is_image = p.name.to_lowercase() == "image";
             // Buffer passes render to OFFSCREEN_FORMAT (Rgba16Float) targets,
@@ -2015,8 +2076,13 @@ impl PreviewApp {
             } else {
                 OFFSCREEN_FORMAT
             };
+            let pipeline_start = Instant::now();
             match create_pipeline(&r.device, target_format, &r.multi_pl, &p.source) {
                 Ok(pipeline) => {
+                    compile_times.push((
+                        p.name.clone(),
+                        pipeline_start.elapsed().as_secs_f64() * 1000.0,
+                    ));
                     let uniform_label = format!("multi-pass-uniform-{}", p.name);
                     let uniform_buf = r.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some(uniform_label.as_str()),
@@ -2039,6 +2105,17 @@ impl PreviewApp {
         }
 
         r.mode = ShaderMode::Multi(pass_pipelines, targets, false);
+        let total_ms: f64 = compile_times.iter().map(|(_, ms)| ms).sum();
+        let detail = compile_times
+            .iter()
+            .map(|(name, ms)| format!("{name}: {ms:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.push_diagnostic(
+            DiagLevel::Info,
+            format!("Pipelines built in {total_ms:.1} ms ({detail})."),
+        );
+        self.pipeline_compile_ms = compile_times;
         self.total_frames = 0;
         self.temporal_reset_pending = true;
         self.multipass_diag_pending = self.multipass_diag_enabled;
@@ -2070,6 +2147,29 @@ impl PreviewApp {
 
     fn render(&mut self) {
         self.process_compile_updates();
+
+        // Cheap settings application: present mode and frame latency only need
+        // a surface reconfigure, not a renderer rebuild.
+        if self.surface_reconfigure_needed {
+            let mut reconfigure_note = None;
+            if let Some(r) = self.renderer.as_mut() {
+                r.config.present_mode = self
+                    .settings
+                    .resolve_present_mode(&self.supported_present_modes);
+                r.config.desired_maximum_frame_latency = self.settings.frame_latency;
+                r.surface.configure(&r.device, &r.config);
+                self.active_present_mode = r.config.present_mode;
+                reconfigure_note = Some(format!(
+                    "Surface reconfigured: {:?}, latency {}.",
+                    r.config.present_mode, r.config.desired_maximum_frame_latency
+                ));
+            }
+            if let Some(note) = reconfigure_note {
+                self.push_diagnostic(DiagLevel::Info, note);
+            }
+            self.surface_reconfigure_needed = false;
+        }
+
         let mut requested_editor_action: Option<PendingEditorAction> = None;
         let mut switch_to_create_mode = false;
         let mut preview_load_path: Option<PathBuf> = None;
@@ -2082,8 +2182,11 @@ impl PreviewApp {
         let mut render_scale = self.render_scale;
         let previous_display_aspect = self.display_aspect;
         let previous_render_scale = self.render_scale;
-        let mut selected_backend = self.requested_backend;
-        let previous_backend = self.requested_backend;
+        let mut ui_settings = self.settings.clone();
+        let previous_settings = self.settings.clone();
+        let available_adapters = self.available_adapters.clone();
+        let supported_present_modes = self.supported_present_modes.clone();
+        let active_present_mode = self.active_present_mode;
         let mut preview_pixel_size = self.preview_pixel_size;
         let _previous_preview_pixel_size = self.preview_pixel_size;
         let mut viewport_rect = self.viewport_rect;
@@ -2357,21 +2460,121 @@ impl PreviewApp {
                                 );
                                 egui::ComboBox::from_id_salt("backend_choice")
                                     .width(settings_w - 16.0)
-                                    .selected_text(selected_backend.label())
+                                    .selected_text(ui_settings.backend.label())
                                     .show_ui(ui, |ui| {
                                         for choice in BackendChoice::ui_choices() {
                                             ui.selectable_value(
-                                                &mut selected_backend,
+                                                &mut ui_settings.backend,
                                                 *choice,
                                                 choice.label(),
                                             );
                                         }
                                     });
+
                                 ui.label(
-                                    egui::RichText::new("rebuilds the renderer")
-                                        .size(10.5)
-                                        .italics()
-                                        .color(egui::Color32::from_rgb(140, 140, 140)),
+                                    egui::RichText::new("GPU").size(12.0).color(label_color),
+                                );
+                                let adapter_text = ui_settings
+                                    .adapter_name
+                                    .clone()
+                                    .unwrap_or_else(|| "Auto".to_string());
+                                egui::ComboBox::from_id_salt("adapter_choice")
+                                    .width(settings_w - 16.0)
+                                    .selected_text(adapter_text)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut ui_settings.adapter_name,
+                                            None,
+                                            "Auto",
+                                        );
+                                        for name in &available_adapters {
+                                            ui.selectable_value(
+                                                &mut ui_settings.adapter_name,
+                                                Some(name.clone()),
+                                                name,
+                                            );
+                                        }
+                                    });
+
+                                ui.label(
+                                    egui::RichText::new("Present").size(12.0).color(label_color),
+                                );
+                                egui::ComboBox::from_id_salt("present_mode_choice")
+                                    .width(settings_w - 16.0)
+                                    .selected_text(ui_settings.present_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for choice in
+                                            render_settings::PresentModeChoice::ui_choices()
+                                        {
+                                            let supported = match choice.to_wgpu() {
+                                                None => true,
+                                                Some(mode) => {
+                                                    supported_present_modes.contains(&mode)
+                                                }
+                                            };
+                                            ui.add_enabled_ui(supported, |ui| {
+                                                let text = if supported {
+                                                    choice.label().to_string()
+                                                } else {
+                                                    format!("{} (unsupported)", choice.label())
+                                                };
+                                                ui.selectable_value(
+                                                    &mut ui_settings.present_mode,
+                                                    *choice,
+                                                    text,
+                                                );
+                                            });
+                                        }
+                                    });
+
+                                ui.label(
+                                    egui::RichText::new("Latency").size(12.0).color(label_color),
+                                );
+                                egui::ComboBox::from_id_salt("frame_latency_choice")
+                                    .width(settings_w - 16.0)
+                                    .selected_text(format!(
+                                        "{} frames",
+                                        ui_settings.frame_latency
+                                    ))
+                                    .show_ui(ui, |ui| {
+                                        for latency in [1u32, 2, 3] {
+                                            ui.selectable_value(
+                                                &mut ui_settings.frame_latency,
+                                                latency,
+                                                format!("{latency} frames"),
+                                            );
+                                        }
+                                    });
+
+                                if active_backend_name == "Dx12" {
+                                    ui.label(
+                                        egui::RichText::new("DX12 compiler")
+                                            .size(12.0)
+                                            .color(label_color),
+                                    );
+                                    egui::ComboBox::from_id_salt("dx12_compiler_choice")
+                                        .width(settings_w - 16.0)
+                                        .selected_text(ui_settings.dx12_compiler.label())
+                                        .show_ui(ui, |ui| {
+                                            for choice in
+                                                render_settings::DxCompilerChoice::ui_choices()
+                                            {
+                                                ui.selectable_value(
+                                                    &mut ui_settings.dx12_compiler,
+                                                    *choice,
+                                                    choice.label(),
+                                                );
+                                            }
+                                        });
+                                }
+
+                                ui.label(
+                                    egui::RichText::new(
+                                        "backend/GPU/compiler rebuild the renderer",
+                                    )
+                                    .size(10.5)
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(140, 140, 140)),
                                 );
 
                                 ui.add_space(2.0);
@@ -2379,6 +2582,14 @@ impl PreviewApp {
                                     egui::RichText::new(format!(
                                         "Resolution: {}×{}",
                                         preview_pixel_size[0], preview_pixel_size[1]
+                                    ))
+                                    .size(11.5)
+                                    .color(label_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Active: {:?} · latency {}",
+                                        active_present_mode, ui_settings.frame_latency
                                     ))
                                     .size(11.5)
                                     .color(label_color),
@@ -3118,16 +3329,23 @@ impl PreviewApp {
         self.display_aspect = display_aspect;
         self.render_scale = render_scale;
 
-        if selected_backend != previous_backend {
-            self.pending_backend_change = Some(selected_backend);
-            self.push_diagnostic(
-                DiagLevel::Info,
-                format!(
-                    "Backend swap requested: {} → {}. Rebuilding renderer…",
-                    previous_backend.label(),
-                    selected_backend.label()
-                ),
-            );
+        if ui_settings != previous_settings {
+            if ui_settings.requires_renderer_rebuild(&previous_settings) {
+                self.push_diagnostic(
+                    DiagLevel::Info,
+                    format!(
+                        "Renderer rebuild requested: {} → {}. Rebuilding…",
+                        previous_settings.backend.label(),
+                        ui_settings.backend.label()
+                    ),
+                );
+                self.pending_rebuild = Some(ui_settings);
+            } else {
+                // Present mode / frame latency apply with a cheap surface
+                // reconfigure on the next frame — no device rebuild.
+                self.settings = ui_settings;
+                self.surface_reconfigure_needed = true;
+            }
         }
         self.new_shader_form.name = new_shader_name;
         self.new_shader_form.kind = new_shader_kind;
@@ -3287,19 +3505,19 @@ impl PreviewApp {
         }
     }
 
-    /// Tear down the current renderer and rebuild it on the requested backend.
-    /// The window is reused. The active shader source is recompiled against
-    /// the new device.
-    fn apply_pending_backend_change(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(new_backend) = self.pending_backend_change.take() else {
+    /// Tear down the current renderer and rebuild it with the requested
+    /// settings (backend, adapter, DX12 compiler). The window is reused. The
+    /// active shader source is recompiled against the new device.
+    fn apply_pending_rebuild(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(new_settings) = self.pending_rebuild.take() else {
             return;
         };
-        if new_backend == self.requested_backend && self.renderer.is_some() {
+        if new_settings == self.settings && self.renderer.is_some() {
             return;
         }
 
-        let previous = self.requested_backend;
-        self.requested_backend = new_backend;
+        let previous = self.settings.clone();
+        self.settings = new_settings.clone();
         // Drop the old wgpu state (instance/surface/device/queue/egui_renderer).
         // The window is preserved on `self.window` so init_renderer reuses it.
         self.renderer = None;
@@ -3314,7 +3532,7 @@ impl PreviewApp {
                     DiagLevel::Success,
                     format!(
                         "Renderer rebuilt on {} (resolved: {}).",
-                        new_backend.label(),
+                        new_settings.backend.label(),
                         self.active_backend_name
                     ),
                 );
@@ -3324,16 +3542,17 @@ impl PreviewApp {
                 self.compile_and_rebuild(CompileTrigger::ShaderLoad);
             }
             Err(error) => {
-                self.requested_backend = previous;
+                let failed_backend = new_settings.backend.label();
+                self.settings = previous;
                 self.push_diagnostic(
                     DiagLevel::Error,
                     format!(
-                        "Backend swap to {} failed: {error}. Reverting to {}.",
-                        new_backend.label(),
-                        previous.label()
+                        "Renderer rebuild on {} failed: {error}. Reverting to {}.",
+                        failed_backend,
+                        self.settings.backend.label()
                     ),
                 );
-                // Try to come back online on the previous backend.
+                // Try to come back online on the previous settings.
                 if let Err(retry_err) = self.init_renderer(event_loop) {
                     self.push_diagnostic(
                         DiagLevel::Error,
@@ -3370,11 +3589,11 @@ impl ApplicationHandler for PreviewApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                // Apply a queued backend swap before drawing the next frame.
+                // Apply a queued renderer rebuild before drawing the next frame.
                 // We can only do this here because `&ActiveEventLoop` is required
                 // by `init_renderer`.
-                if self.pending_backend_change.is_some() {
-                    self.apply_pending_backend_change(event_loop);
+                if self.pending_rebuild.is_some() {
+                    self.apply_pending_rebuild(event_loop);
                 }
                 if self.pending_surface_size.is_none() {
                     self.render();
@@ -4419,10 +4638,13 @@ mod tests {
 
 fn main() {
     env_logger::init();
-    let requested_backend = BackendChoice::parse(std::env::args().nth(1).as_deref());
+    let initial_settings = render_settings::RenderSettings {
+        backend: BackendChoice::parse(std::env::args().nth(1).as_deref()),
+        ..Default::default()
+    };
     let commands = spawn_stdin_thread();
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = PreviewApp::new(requested_backend, commands);
+    let mut app = PreviewApp::new(initial_settings, commands);
     event_loop
         .run_app(&mut app)
         .expect("failed to run PersonalShaderToy");
