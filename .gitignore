@@ -10,3 +10,5 @@ target/
 *.dSYM
 build_error.txt
 temp_err.txt
+
+/benchmarks/

@@ -63,6 +63,90 @@ impl FrameStats {
     }
 }
 
+/// One backend's benchmark run inside a sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub backend: String,
+    pub adapter: String,
+    /// Present mode actually used (after fallback), not necessarily the requested one.
+    pub present_mode: String,
+    pub resolution: [u32; 2],
+    pub frames: u32,
+    pub cpu: Option<FrameStats>,
+    pub gpu: Option<FrameStats>,
+    pub pipeline_compile_ms: Option<f64>,
+    /// Set when the backend failed to init or compile; stats fields are None.
+    pub error: Option<String>,
+}
+
+/// A full benchmark sweep over multiple backends for one shader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepResult {
+    pub shader: String,
+    pub timestamp_unix: u64,
+    pub warmup_secs: f64,
+    pub measure_secs: f64,
+    pub runs: Vec<RunRecord>,
+}
+
+pub fn sweep_filename(shader: &str, timestamp_unix: u64) -> String {
+    let slug: String = shader
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let mut collapsed = String::with_capacity(slug.len());
+    let mut prev_dash = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_dash {
+                collapsed.push(c);
+            }
+            prev_dash = true;
+        } else {
+            collapsed.push(c);
+            prev_dash = false;
+        }
+    }
+    format!("{collapsed}-{timestamp_unix}.json")
+}
+
+pub fn save_sweep(
+    result: &SweepResult,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(sweep_filename(&result.shader, result.timestamp_unix));
+    let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+pub fn load_sweep(path: &std::path::Path) -> Result<SweepResult, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Saved sweeps in `dir`, newest first (file names end in a unix timestamp).
+pub fn list_sweeps(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +195,55 @@ mod tests {
         assert_eq!(s.median_ms, 20.0);
         assert_eq!(s.min_ms, 10.0);
         assert_eq!(s.max_ms, 30.0);
+    }
+
+    #[test]
+    fn sweep_result_json_round_trip() {
+        let result = SweepResult {
+            shader: "test5.wgsl".into(),
+            timestamp_unix: 1_750_000_000,
+            warmup_secs: 3.0,
+            measure_secs: 10.0,
+            runs: vec![RunRecord {
+                backend: "Vulkan".into(),
+                adapter: "Test GPU".into(),
+                present_mode: "Immediate".into(),
+                resolution: [1280, 720],
+                frames: 1200,
+                cpu: FrameStats::from_samples_ms(&[8.0, 9.0, 10.0]),
+                gpu: None,
+                pipeline_compile_ms: Some(42.5),
+                error: None,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&result).unwrap();
+        let back: SweepResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runs.len(), 1);
+        assert_eq!(back.runs[0].backend, "Vulkan");
+        assert_eq!(back.runs[0].cpu.as_ref().unwrap().count, 3);
+    }
+
+    #[test]
+    fn sweep_filename_slugs_shader_name() {
+        assert_eq!(
+            sweep_filename("Kerr Newman (v2).glsl", 123),
+            "kerr-newman-v2-glsl-123.json"
+        );
+    }
+
+    #[test]
+    fn save_and_load_sweep() {
+        let dir = std::env::temp_dir().join(format!("pst-bench-{}", std::process::id()));
+        let result = SweepResult {
+            shader: "t.wgsl".into(),
+            timestamp_unix: 42,
+            warmup_secs: 1.0,
+            measure_secs: 2.0,
+            runs: vec![],
+        };
+        let path = save_sweep(&result, &dir).unwrap();
+        let loaded = load_sweep(&path).unwrap();
+        assert_eq!(loaded.timestamp_unix, 42);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
