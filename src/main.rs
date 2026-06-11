@@ -25,6 +25,8 @@ use winit::{
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State as EguiWinitState;
 
+mod bench;
+
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const DEFAULT_WINDOW_WIDTH: u32 = 1600;
 const DEFAULT_WINDOW_HEIGHT: u32 = 900;
