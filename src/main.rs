@@ -731,6 +731,8 @@ struct PreviewApp {
     /// PST_AUTO_BENCH: start a sweep automatically once the startup shader is
     /// live, then exit when it finishes. Value may be "warmup,measure" secs.
     auto_bench: bool,
+    /// PST_AUTO_BENCH_SHADER: shader to load before the automatic sweep.
+    auto_bench_shader: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1072,6 +1074,7 @@ impl PreviewApp {
                 bench_measure_secs = measure.clamp(1.0, 60.0);
             }
         }
+        let auto_bench_shader = std::env::var_os("PST_AUTO_BENCH_SHADER").map(PathBuf::from);
 
         let (shader_watch_tx, shader_watch_rx) = mpsc::channel();
         let (compile_update_tx, compile_update_rx) = mpsc::channel();
@@ -1175,6 +1178,7 @@ impl PreviewApp {
                 .map(|choice| (choice, true))
                 .collect(),
             auto_bench,
+            auto_bench_shader,
         }
     }
 
@@ -3711,6 +3715,18 @@ impl PreviewApp {
         }
         self.new_shader_form.name = new_shader_name;
         self.new_shader_form.kind = new_shader_kind;
+
+        // Scripted benchmarking may target a specific shader; load it once the
+        // renderer is up. The sweep below waits until this compile completes.
+        if self.renderer.is_some()
+            && let Some(path) = self.auto_bench_shader.take()
+            && let Err(error) = self.load_shader_for_preview(&path, CompileTrigger::ShaderLoad)
+        {
+            self.push_diagnostic(
+                DiagLevel::Error,
+                format!("PST_AUTO_BENCH_SHADER failed: {error}"),
+            );
+        }
 
         // Headless/scripted benchmarking: start once the startup shader has
         // been live for ~30 frames; drive_benchmark exits the app at the end.
