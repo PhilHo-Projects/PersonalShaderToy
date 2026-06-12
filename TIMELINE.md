@@ -18,6 +18,7 @@
 - Native multipass viewport/uniform stability: `fixed`
 - GLSL/WGSL translation and Shadertoy compatibility: `active work`
 - Tauri/sidecar path removal: `complete`
+- Render lab (settings + GPU timing + percentile stats + benchmark sweep): `complete`
 - Engine export: `deferred`
 
 ## Exit Criteria For The Current Stage
@@ -60,6 +61,17 @@
 - `cargo run --bin test_parse shaders/Shadertoy/kerr_newman_black_hole.glsl`
 
 ## Journal
+
+### 2026-06-12 — Render lab: settings, GPU timing, benchmark sweep
+
+- Added `src/render_settings.rs` (backend/adapter/present-mode/latency/DX12-compiler model), `src/gpu_timer.rs` (per-pass timestamp queries with async readback ring), and `src/bench.rs` (percentile stats, sweep state machine, JSON persistence) with unit tests for all pure logic.
+- Live stats upgraded to rolling percentiles (avg/p95/p99/1% low) plus GPU pass breakdown.
+- `Run Benchmark` sweeps selected backends with warmup/measure phases and renders a best-value-highlighted comparison table; sweeps save to `benchmarks/` and reload across sessions.
+- Headless mode: `PST_AUTO_BENCH=1,4` + `PST_AUTO_BENCH_SHADER=shaders\Test\test5.wgsl` ran full DX12/Vulkan/GL sweeps and exited cleanly.
+- The sweep caught two host bugs on its first runs:
+  - GL swapchain panic in `Surface::configure`: the screenshot `COPY_SRC` usage is not universally supported; it is now requested only when the surface offers it and screenshots degrade with a warning.
+  - Event-loop deadlock: the resize-settle branch in `about_to_wait` returned without requesting a redraw, parking the Wait-driven loop before the first frame whenever no further OS events arrived (headless runs or an untouched window).
+- First real numbers (RTX 4060 Laptop, test5.wgsl, Immediate): Vulkan and GL p95 ≈ 6.2 ms vs DX12 8.1 ms; DX12 1% low 113 fps vs ~152 fps; pipeline compile DX12 33 ms / Vulkan 46 ms / GL 52 ms.
 
 ### 2026-04-24 — Native multipass centering bug finally isolated
 

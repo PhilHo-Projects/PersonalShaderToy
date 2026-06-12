@@ -85,8 +85,22 @@
   - `Render Scale`: `0.5x`, `0.75x`, `1.0x`
 - Native multipass rendering now uses per-pass uniform buffers, which fixed the sampled-buffer drift exposed by `shaders/Test/test5.wgsl`.
 - Native screenshots can be requested through the existing `TakeScreenshot`/`ScreenshotTaken` command path and are written under `target/native-captures/`.
+- The native app is now a render lab:
+  - `src/render_settings.rs` holds every renderer knob: backend, GPU adapter picker, present mode (with per-surface support detection and fallback), frame latency, and DX12 shader compiler (FXC vs statically linked DXC).
+  - Present mode and frame latency apply via cheap surface reconfigure; backend/adapter/compiler changes rebuild the renderer on the same window.
+  - `src/gpu_timer.rs` provides per-pass GPU timing through timestamp queries with a non-blocking readback ring; backends without support degrade to "GPU: n/a".
+  - Live stats show rolling FPS, avg/p95/p99 frame times, 1% lows, and GPU pass breakdown from a 600-frame history (`src/bench.rs` stats math).
+  - A benchmark sweep cycles selected backends (warmup + measure each), records CPU/GPU stats and pipeline compile times, renders a side-by-side results table, and saves JSON under `benchmarks/` (gitignored) with reload support.
+  - `PST_AUTO_BENCH=warmup,measure` (optionally with `PST_AUTO_BENCH_SHADER=path`) runs a sweep headlessly and exits, for scripted comparisons.
 
 ## Recent Decision Log
+
+### 2026-06-12
+
+- Adopted the "render lab" direction: every interesting wgpu setting is exposed for tinkering and the benchmark sweep is the canonical way to compare backends.
+- Benchmark sweeps force the Immediate present mode by default (falling back Mailbox → Fifo) so vsync does not flatten comparisons; the mode actually used is recorded per run.
+- New code goes into focused modules (`src/bench.rs`, `src/render_settings.rs`, `src/gpu_timer.rs`) with small hooks in `main.rs`; no big-bang refactor of the monolith.
+- The first sweep immediately exposed and fixed two host bugs: GL swapchains rejecting the screenshot `COPY_SRC` usage (now requested only when supported), and the resize-settle path parking the event loop before the first frame when no OS events arrive.
 
 ### 2026-04-24
 

@@ -47,3 +47,10 @@ This file is the canonical project instruction source. `AGENTS.md` must mirror i
 - On `2026-04-24`, the long-running native multipass centering issue was traced to a host-side uniform lifetime bug, not to `test5.wgsl` shader math.
 - Each compiled native multipass pass must own and bind its own uniform buffer. Reusing one shared `multi_uniform_buf` lets later Image-pass viewport uniforms overwrite earlier offscreen pass uniforms before the GPU executes the submitted command encoder.
 - After that fix, remaining Kerr-Newman work should be treated as shader parity/visual-baseline work unless a small diagnostic shader proves a host regression.
+
+## Render Lab Notes
+
+- On `2026-06-12`, the native app gained render-lab features: render settings in `src/render_settings.rs` (backend, adapter picker, present mode, frame latency, DX12 compiler), per-pass GPU timing in `src/gpu_timer.rs`, and percentile stats plus an automated benchmark sweep in `src/bench.rs`.
+- Present mode and frame latency apply via surface reconfigure; backend, adapter, and DX12 compiler changes rebuild the renderer on the same window.
+- Benchmark sweeps save JSON to `benchmarks/` (gitignored). Headless: set `PST_AUTO_BENCH=warmup,measure` and optionally `PST_AUTO_BENCH_SHADER=path` — the app sweeps and exits on its own.
+- Two host invariants learned from the first sweeps: never request surface usages the capabilities don't list (GL lacks `COPY_SRC`; `Surface::configure` panics), and every `about_to_wait` path must request a redraw or the Wait-driven event loop parks before the first frame.
