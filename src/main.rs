@@ -717,6 +717,20 @@ struct PreviewApp {
     /// Rolling GPU frame-time history (ms) from GpuTimer, same cap.
     gpu_frame_history: std::collections::VecDeque<f64>,
     last_frame_at: Option<Instant>,
+
+    // Benchmark sweep
+    bench_runner: Option<bench::BenchRunner>,
+    /// Settings to restore after the sweep finishes.
+    bench_prev_settings: Option<render_settings::RenderSettings>,
+    bench_result: Option<bench::SweepResult>,
+    bench_saved_path: Option<PathBuf>,
+    bench_warmup_secs: f64,
+    bench_measure_secs: f64,
+    bench_force_uncapped: bool,
+    bench_selected_backends: Vec<(BackendChoice, bool)>,
+    /// PST_AUTO_BENCH: start a sweep automatically once the startup shader is
+    /// live, then exit when it finishes. Value may be "warmup,measure" secs.
+    auto_bench: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1044,6 +1058,21 @@ impl PreviewApp {
         initial_settings: render_settings::RenderSettings,
         commands: Receiver<SidecarCommand>,
     ) -> Self {
+        // Scripted benchmarking: PST_AUTO_BENCH=1 or PST_AUTO_BENCH=warmup,measure.
+        let mut auto_bench = false;
+        let mut bench_warmup_secs = 3.0;
+        let mut bench_measure_secs = 10.0;
+        if let Ok(spec) = std::env::var("PST_AUTO_BENCH") {
+            auto_bench = true;
+            let mut parts = spec.split(',');
+            if let Some(warmup) = parts.next().and_then(|v| v.trim().parse::<f64>().ok()) {
+                bench_warmup_secs = warmup.clamp(0.5, 30.0);
+            }
+            if let Some(measure) = parts.next().and_then(|v| v.trim().parse::<f64>().ok()) {
+                bench_measure_secs = measure.clamp(1.0, 60.0);
+            }
+        }
+
         let (shader_watch_tx, shader_watch_rx) = mpsc::channel();
         let (compile_update_tx, compile_update_rx) = mpsc::channel();
         let multipass_diag_enabled = std::env::var_os("PST_MULTIPASS_DIAG").is_some();
@@ -1132,6 +1161,20 @@ impl PreviewApp {
             cpu_frame_history: std::collections::VecDeque::new(),
             gpu_frame_history: std::collections::VecDeque::new(),
             last_frame_at: None,
+            bench_runner: None,
+            bench_prev_settings: None,
+            bench_result: None,
+            bench_saved_path: None,
+            bench_warmup_secs,
+            bench_measure_secs,
+            bench_force_uncapped: true,
+            bench_selected_backends: BackendChoice::ui_choices()
+                .iter()
+                .copied()
+                .filter(|choice| *choice != BackendChoice::Auto)
+                .map(|choice| (choice, true))
+                .collect(),
+            auto_bench,
         }
     }
 
@@ -1439,8 +1482,18 @@ impl PreviewApp {
             .unwrap_or(capabilities.alpha_modes[0]);
 
         self.supported_present_modes = capabilities.present_modes.clone();
+        // COPY_SRC enables screenshots, but not every surface supports it
+        // (GL swapchains typically don't) — configure() panics on unsupported
+        // usages, so only request what the surface offers.
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if capabilities
+            .usages
+            .contains(wgpu::TextureUsages::COPY_SRC)
+        {
+            surface_usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: surface_usage,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -1932,6 +1985,9 @@ impl PreviewApp {
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
+                if let Some(runner) = self.bench_runner.as_mut() {
+                    runner.backend_failed(format!("Shader preparation failed: {error}"));
+                }
                 let err_msg = format!(
                     "Shader preparation failed for '{}' after {} ms:\n{}",
                     self.loaded_shader_name, elapsed_ms, error
@@ -1955,6 +2011,27 @@ impl PreviewApp {
 
         match build_result {
             Ok(()) => {
+                // The benchmark waits for the shader to be live on the swapped
+                // backend before starting its warmup. No-op outside a sweep.
+                if self.bench_runner.is_some() {
+                    let now = self.start_time.elapsed().as_secs_f64();
+                    let backend = self.active_backend_name.clone();
+                    let adapter = self.active_adapter_name.clone();
+                    let present_mode = format!("{:?}", self.active_present_mode);
+                    let resolution = self.preview_pixel_size;
+                    let compile_total: f64 =
+                        self.pipeline_compile_ms.iter().map(|(_, ms)| ms).sum();
+                    if let Some(runner) = self.bench_runner.as_mut() {
+                        runner.backend_ready(
+                            now,
+                            backend,
+                            adapter,
+                            present_mode,
+                            resolution,
+                            (compile_total > 0.0).then_some(compile_total),
+                        );
+                    }
+                }
                 emit(&SidecarEvent::ShaderUpdated { success: true });
                 if trigger.should_log_success() {
                     let pass_label = if pass_count == 1 { "pass" } else { "passes" };
@@ -1973,6 +2050,9 @@ impl PreviewApp {
                 }
             }
             Err(error) => {
+                if let Some(runner) = self.bench_runner.as_mut() {
+                    runner.backend_failed(format!("Pipeline build failed: {error}"));
+                }
                 let err_msg = format!(
                     "Compile failed for '{}' after {} ms: {}",
                     self.loaded_shader_name, elapsed_ms, error
@@ -2204,6 +2284,20 @@ impl PreviewApp {
             self.surface_reconfigure_needed = false;
         }
 
+        // Screenshots copy from the surface texture, which needs COPY_SRC.
+        if self.screenshot_requested
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| !r.config.usage.contains(wgpu::TextureUsages::COPY_SRC))
+        {
+            self.screenshot_requested = false;
+            self.push_diagnostic(
+                DiagLevel::Warning,
+                "Screenshots are not supported on this backend's surface.".to_string(),
+            );
+        }
+
         let mut requested_editor_action: Option<PendingEditorAction> = None;
         let mut switch_to_create_mode = false;
         let mut preview_load_path: Option<PathBuf> = None;
@@ -2221,6 +2315,8 @@ impl PreviewApp {
         let available_adapters = self.available_adapters.clone();
         let supported_present_modes = self.supported_present_modes.clone();
         let active_present_mode = self.active_present_mode;
+        let mut start_bench = false;
+        let mut bench_load_path: Option<PathBuf> = None;
         let mut preview_pixel_size = self.preview_pixel_size;
         let _previous_preview_pixel_size = self.preview_pixel_size;
         let mut viewport_rect = self.viewport_rect;
@@ -2243,12 +2339,14 @@ impl PreviewApp {
         };
         // Harvest any completed GPU timestamp readbacks before encoding the
         // new frame so `latest()` reflects the freshest finished frame.
+        let mut new_gpu_total: Option<f64> = None;
         if let Some(t) = r.gpu_timer.as_mut() {
             for total_ms in t.begin_frame() {
                 self.gpu_frame_history.push_back(total_ms);
                 while self.gpu_frame_history.len() > STATS_HISTORY {
                     self.gpu_frame_history.pop_front();
                 }
+                new_gpu_total = Some(total_ms);
             }
         }
         let gpu_latest_timing = r
@@ -2432,8 +2530,22 @@ impl PreviewApp {
             // the shader viewport.
             let bottom_total_w = ui.available_width();
             let gap = 8.0;
-            let logs_w = ((bottom_total_w - gap) * 0.75).max(120.0);
-            let settings_w = (bottom_total_w - gap - logs_w).max(180.0);
+            // The Benchmark column only appears when there's room (it is
+            // hidden in the narrow Create Shader preview panel).
+            let show_bench_column = bottom_total_w > 700.0;
+            let (logs_w, bench_w) = if show_bench_column {
+                (
+                    ((bottom_total_w - 2.0 * gap) * 0.50).max(120.0),
+                    ((bottom_total_w - 2.0 * gap) * 0.25).max(160.0),
+                )
+            } else {
+                (((bottom_total_w - gap) * 0.75).max(120.0), 0.0)
+            };
+            let settings_w = (bottom_total_w
+                - gap
+                - logs_w
+                - if show_bench_column { gap + bench_w } else { 0.0 })
+            .max(180.0);
             let bottom_h = PREVIEW_LOG_HEIGHT;
 
             ui.horizontal_top(|ui| {
@@ -2482,6 +2594,153 @@ impl PreviewApp {
                 );
 
                 ui.separator();
+
+                // ── Benchmark (middle, 25%) ────────────────────────────────
+                if show_bench_column {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(bench_w, bottom_h),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.label(egui::RichText::new("🏁 Benchmark").strong());
+                            egui::ScrollArea::vertical()
+                                .id_salt("bench_scroll")
+                                .max_height(bottom_h - 24.0)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    let dim = egui::Color32::from_rgb(170, 170, 170);
+
+                                    if let Some(runner) = &self.bench_runner {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(12.0));
+                                            ui.label(
+                                                egui::RichText::new(runner.status_line())
+                                                    .size(11.5)
+                                                    .color(egui::Color32::from_rgb(
+                                                        255, 210, 120,
+                                                    )),
+                                            );
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Warmup")
+                                                    .size(11.0)
+                                                    .color(dim),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut self.bench_warmup_secs,
+                                                )
+                                                .range(1.0..=30.0)
+                                                .speed(0.5)
+                                                .suffix(" s"),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("Measure")
+                                                    .size(11.0)
+                                                    .color(dim),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut self.bench_measure_secs,
+                                                )
+                                                .range(2.0..=60.0)
+                                                .speed(0.5)
+                                                .suffix(" s"),
+                                            );
+                                        });
+                                        ui.checkbox(
+                                            &mut self.bench_force_uncapped,
+                                            egui::RichText::new("Force uncapped (Immediate)")
+                                                .size(11.0),
+                                        );
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (choice, enabled) in
+                                                self.bench_selected_backends.iter_mut()
+                                            {
+                                                ui.checkbox(
+                                                    enabled,
+                                                    egui::RichText::new(choice.label())
+                                                        .size(11.0),
+                                                );
+                                            }
+                                        });
+                                        let can_run = self.active_compile.is_none();
+                                        if ui
+                                            .add_enabled(
+                                                can_run,
+                                                egui::Button::new("▶ Run Benchmark"),
+                                            )
+                                            .clicked()
+                                        {
+                                            start_bench = true;
+                                        }
+                                        let saved =
+                                            bench::list_sweeps(Path::new("benchmarks"));
+                                        if !saved.is_empty() {
+                                            egui::ComboBox::from_id_salt("bench_load_prev")
+                                                .width(bench_w - 24.0)
+                                                .selected_text("Load previous…")
+                                                .show_ui(ui, |ui| {
+                                                    for path in saved.iter().take(15) {
+                                                        let name = path
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy()
+                                                            .to_string();
+                                                        if ui
+                                                            .selectable_label(false, name)
+                                                            .clicked()
+                                                        {
+                                                            bench_load_path =
+                                                                Some(path.clone());
+                                                        }
+                                                    }
+                                                });
+                                        }
+                                    }
+
+                                    if let Some(result) = &self.bench_result {
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {:.0}s measure · {}×{}",
+                                                result.shader,
+                                                result.measure_secs,
+                                                result
+                                                    .runs
+                                                    .first()
+                                                    .map(|r| r.resolution[0])
+                                                    .unwrap_or(0),
+                                                result
+                                                    .runs
+                                                    .first()
+                                                    .map(|r| r.resolution[1])
+                                                    .unwrap_or(0),
+                                            ))
+                                            .size(10.5)
+                                            .color(dim),
+                                        );
+                                        render_bench_table(ui, &result.runs);
+                                        if let Some(path) = &self.bench_saved_path {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "saved: {}",
+                                                    path.display()
+                                                ))
+                                                .size(9.5)
+                                                .color(egui::Color32::from_rgb(
+                                                    120, 120, 120,
+                                                )),
+                                            );
+                                        }
+                                    }
+                                });
+                        },
+                    );
+
+                    ui.separator();
+                }
 
                 // ── Settings (right, 25%) ──────────────────────────────────
                 ui.allocate_ui_with_layout(
@@ -3430,7 +3689,9 @@ impl PreviewApp {
         self.display_aspect = display_aspect;
         self.render_scale = render_scale;
 
-        if ui_settings != previous_settings {
+        // User settings changes are ignored while a benchmark drives the
+        // renderer — the sweep owns backend/present-mode until it finishes.
+        if ui_settings != previous_settings && self.bench_runner.is_none() {
             if ui_settings.requires_renderer_rebuild(&previous_settings) {
                 self.push_diagnostic(
                     DiagLevel::Info,
@@ -3450,6 +3711,69 @@ impl PreviewApp {
         }
         self.new_shader_form.name = new_shader_name;
         self.new_shader_form.kind = new_shader_kind;
+
+        // Headless/scripted benchmarking: start once the startup shader has
+        // been live for ~30 frames; drive_benchmark exits the app at the end.
+        if self.auto_bench
+            && self.bench_runner.is_none()
+            && self.bench_result.is_none()
+            && self.active_compile.is_none()
+            && self.total_frames > 30
+        {
+            start_bench = true;
+        }
+
+        if start_bench && self.bench_runner.is_none() {
+            let labels: Vec<String> = self
+                .bench_selected_backends
+                .iter()
+                .filter(|(_, enabled)| *enabled)
+                .map(|(choice, _)| choice.label().to_string())
+                .collect();
+            if labels.is_empty() {
+                self.push_diagnostic(
+                    DiagLevel::Warning,
+                    "Benchmark: no backends selected.".to_string(),
+                );
+            } else {
+                self.bench_prev_settings = Some(self.settings.clone());
+                self.bench_result = None;
+                self.bench_saved_path = None;
+                self.push_diagnostic(
+                    DiagLevel::Info,
+                    format!(
+                        "Benchmark started: {} · warmup {:.0}s · measure {:.0}s.",
+                        labels.join(", "),
+                        self.bench_warmup_secs,
+                        self.bench_measure_secs
+                    ),
+                );
+                self.bench_runner = Some(bench::BenchRunner::new(bench::BenchConfig {
+                    warmup_secs: self.bench_warmup_secs,
+                    measure_secs: self.bench_measure_secs,
+                    backend_labels: labels,
+                    force_uncapped: self.bench_force_uncapped,
+                }));
+            }
+        }
+        if let Some(path) = bench_load_path {
+            match bench::load_sweep(&path) {
+                Ok(result) => {
+                    self.bench_result = Some(result);
+                    self.bench_saved_path = Some(path);
+                }
+                Err(error) => {
+                    self.push_diagnostic(
+                        DiagLevel::Warning,
+                        format!("Could not load benchmark: {error}"),
+                    );
+                }
+            }
+        }
+
+        // Benchmark drive comes after the user-settings block so a sweep's
+        // backend swap always wins the pending_rebuild slot for this frame.
+        self.drive_benchmark(new_gpu_total);
 
         if let Some(message) = multipass_diag_to_emit {
             self.push_diagnostic(DiagLevel::Info, message.clone());
@@ -3606,6 +3930,97 @@ impl PreviewApp {
         }
     }
 
+    /// Drive the benchmark sweep one step. Called once per frame at the end
+    /// of render(): feeds the frame that just completed, then executes the
+    /// runner's next action (backend swap / finish).
+    fn drive_benchmark(&mut self, new_gpu_total_ms: Option<f64>) {
+        if self.bench_runner.is_none() {
+            return;
+        }
+        let now = self.start_time.elapsed().as_secs_f64();
+
+        if let (Some(runner), Some(cpu_ms)) = (
+            self.bench_runner.as_mut(),
+            self.cpu_frame_history.back().copied(),
+        ) {
+            runner.record_frame(now, cpu_ms, new_gpu_total_ms);
+        }
+
+        let force_uncapped = self
+            .bench_runner
+            .as_ref()
+            .map(|runner| runner.config().force_uncapped)
+            .unwrap_or(true);
+        let action = match self.bench_runner.as_mut() {
+            Some(runner) => runner.next_action(),
+            None => return,
+        };
+
+        match action {
+            bench::BenchAction::None => {}
+            bench::BenchAction::SwitchBackend { label } => {
+                let choice = BackendChoice::ui_choices()
+                    .iter()
+                    .copied()
+                    .find(|c| c.label() == label);
+                match choice {
+                    Some(backend) => {
+                        let mut bench_settings = self.settings.clone();
+                        bench_settings.backend = backend;
+                        // Keep the user's adapter preference if one was set.
+                        bench_settings.adapter_name = self
+                            .bench_prev_settings
+                            .as_ref()
+                            .and_then(|prev| prev.adapter_name.clone());
+                        if force_uncapped {
+                            bench_settings.present_mode =
+                                render_settings::PresentModeChoice::Immediate;
+                        }
+                        self.pending_rebuild = Some(bench_settings);
+                    }
+                    None => {
+                        if let Some(runner) = self.bench_runner.as_mut() {
+                            runner.backend_failed(format!("Unknown backend label '{label}'"));
+                        }
+                    }
+                }
+            }
+            bench::BenchAction::Finished => {
+                let shader = self.loaded_shader_name.clone();
+                let result = self
+                    .bench_runner
+                    .as_mut()
+                    .and_then(|runner| runner.take_result(shader));
+                if let Some(result) = result {
+                    match bench::save_sweep(&result, Path::new("benchmarks")) {
+                        Ok(path) => {
+                            self.push_diagnostic(
+                                DiagLevel::Success,
+                                format!("Benchmark sweep complete → {}", path.display()),
+                            );
+                            self.bench_saved_path = Some(path);
+                        }
+                        Err(error) => {
+                            self.push_diagnostic(
+                                DiagLevel::Warning,
+                                format!("Benchmark finished but could not save: {error}"),
+                            );
+                        }
+                    }
+                    self.bench_result = Some(result);
+                }
+                self.bench_runner = None;
+                // Put the renderer back the way the user had it.
+                if let Some(prev) = self.bench_prev_settings.take() {
+                    self.pending_rebuild = Some(prev);
+                }
+                if self.auto_bench {
+                    self.should_exit = true;
+                }
+            }
+        }
+    }
+
     /// Tear down the current renderer and rebuild it with the requested
     /// settings (backend, adapter, DX12 compiler). The window is reused. The
     /// active shader source is recompiled against the new device.
@@ -3644,6 +4059,11 @@ impl PreviewApp {
             }
             Err(error) => {
                 let failed_backend = new_settings.backend.label();
+                // A failed swap during a sweep records the run as failed and
+                // lets the sweep continue with the next backend.
+                if let Some(runner) = self.bench_runner.as_mut() {
+                    runner.backend_failed(format!("Renderer init failed: {error}"));
+                }
                 self.settings = previous;
                 self.push_diagnostic(
                     DiagLevel::Error,
@@ -3806,9 +4226,14 @@ impl ApplicationHandler for PreviewApp {
         if let Some(last_resize_request_at) = self.last_resize_request_at {
             if last_resize_request_at.elapsed() >= RESIZE_SETTLE_DELAY {
                 self.apply_queued_resize();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+            }
+            // Keep the loop ticking while the resize settles. Returning
+            // without a redraw request parks the Wait-driven event loop —
+            // the startup Resized event would otherwise deadlock the app
+            // before its first frame when no further OS events arrive
+            // (headless runs, or a window nobody touches).
+            if let Some(w) = &self.window {
+                w.request_redraw();
             }
             return;
         }
@@ -4650,6 +5075,101 @@ fn chrono_date_vec() -> [f32; 4] {
     let day = ((days % 365) % 30) as f32;
     let tod = (secs % 86400) as f32;
     [year, month, day, tod]
+}
+
+/// Transposed benchmark results table: metrics as rows, one column per run.
+/// Best avg-FPS and best p95 across successful runs are highlighted.
+fn render_bench_table(ui: &mut egui::Ui, runs: &[bench::RunRecord]) {
+    let best_color = egui::Color32::from_rgb(145, 205, 145);
+    let cell_color = egui::Color32::from_rgb(200, 200, 200);
+    let err_color = egui::Color32::from_rgb(255, 90, 90);
+
+    let best_fps_idx = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, run)| run.cpu.as_ref().map(|c| (i, c.avg_fps())))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(i, _)| i);
+    let best_p95_idx = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, run)| run.cpu.as_ref().map(|c| (i, c.p95_ms)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(i, _)| i);
+
+    let cell = |text: String, highlight: bool| {
+        egui::RichText::new(text)
+            .size(10.5)
+            .color(if highlight { best_color } else { cell_color })
+    };
+
+    egui::Grid::new("bench_results_grid")
+        .striped(true)
+        .min_col_width(52.0)
+        .show(ui, |ui| {
+            ui.label(cell(String::new(), false));
+            for run in runs {
+                ui.label(
+                    egui::RichText::new(&run.backend)
+                        .size(10.5)
+                        .strong()
+                        .color(cell_color),
+                );
+            }
+            ui.end_row();
+
+            type RowFn = fn(&bench::RunRecord) -> Option<String>;
+            let rows: [(&str, RowFn); 8] = [
+                ("mode", |r| Some(r.present_mode.clone())),
+                ("avg fps", |r| {
+                    r.cpu.as_ref().map(|c| format!("{:.0}", c.avg_fps()))
+                }),
+                ("avg ms", |r| {
+                    r.cpu.as_ref().map(|c| format!("{:.2}", c.avg_ms))
+                }),
+                ("p95 ms", |r| {
+                    r.cpu.as_ref().map(|c| format!("{:.2}", c.p95_ms))
+                }),
+                ("p99 ms", |r| {
+                    r.cpu.as_ref().map(|c| format!("{:.2}", c.p99_ms))
+                }),
+                ("1% low fps", |r| {
+                    r.cpu.as_ref().map(|c| format!("{:.0}", c.low_1pct_fps()))
+                }),
+                ("gpu avg ms", |r| {
+                    r.gpu.as_ref().map(|g| format!("{:.2}", g.avg_ms))
+                }),
+                ("compile ms", |r| {
+                    r.pipeline_compile_ms.map(|ms| format!("{ms:.1}"))
+                }),
+            ];
+
+            for (label, value_fn) in rows {
+                ui.label(cell(label.to_string(), false));
+                for (i, run) in runs.iter().enumerate() {
+                    let highlight = (label == "avg fps" && Some(i) == best_fps_idx)
+                        || (label == "p95 ms" && Some(i) == best_p95_idx);
+                    let text = value_fn(run).unwrap_or_else(|| "—".to_string());
+                    ui.label(cell(text, highlight));
+                }
+                ui.end_row();
+            }
+
+            // Status row: ok / error (full reason on hover).
+            ui.label(cell("status".to_string(), false));
+            for run in runs {
+                match &run.error {
+                    Some(reason) => {
+                        ui.label(egui::RichText::new("✖ failed").size(10.5).color(err_color))
+                            .on_hover_text(reason);
+                    }
+                    None => {
+                        ui.label(cell(format!("{} frames", run.frames), false));
+                    }
+                }
+            }
+            ui.end_row();
+        });
 }
 
 fn format_runtime(duration: Duration) -> String {
