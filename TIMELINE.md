@@ -62,6 +62,17 @@
 
 ## Journal
 
+### 2026-06-12 — Backend-swap crash fixed: GL taints the HWND for DXGI
+
+- Symptom: switching backends at runtime Gl → Dx12 crashed: `wgpu_hal::dx12 SwapChain creation error: Access is denied (0x80070005)`, then a fatal `Surface::configure → Invalid surface` panic (exit 101).
+- Diagnosis via `examples/backend_swap_probe.rs`: WGL permanently sets the window's pixel format the first time the GL backend touches it, and DXGI then refuses to create a swapchain on that HWND. The same DX12 request succeeds on a freshly created window.
+- Fixes:
+  - `apply_pending_rebuild` replaces the native window when leaving the GL backend on Windows, carrying over size, position, and maximized state.
+  - `init_renderer` wraps `Surface::configure` in an error scope so configure failures return `Err` into the existing revert path instead of panicking (configure reports through the device error sink, not a `Result`).
+  - Sidecar `set_backend` now drives the same live rebuild path as the UI instead of replying "requires restarting the sidecar".
+  - Hygiene: removed the unread `FrameGpuTiming::total_ms` field, gated `BenchRunner::is_active` to tests; `cargo check` is warning-free again.
+- Verification: scripted stdin run Dx12 → Gl → Dx12 exits 0 with three `WindowReady` events; quick headless sweep (`PST_AUTO_BENCH=0.5,1`) across DX12/Vulkan/GL still completes and saves JSON; `cargo test` 19 passed.
+
 ### 2026-06-12 — Render lab: settings, GPU timing, benchmark sweep
 
 - Added `src/render_settings.rs` (backend/adapter/present-mode/latency/DX12-compiler model), `src/gpu_timer.rs` (per-pass timestamp queries with async readback ring), and `src/bench.rs` (percentile stats, sweep state machine, JSON persistence) with unit tests for all pure logic.

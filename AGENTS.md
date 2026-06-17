@@ -51,6 +51,7 @@ This file mirrors `CLAUDE.md`. Keep both files synchronized.
 ## Render Lab Notes
 
 - On `2026-06-12`, the native app gained render-lab features: render settings in `src/render_settings.rs` (backend, adapter picker, present mode, frame latency, DX12 compiler), per-pass GPU timing in `src/gpu_timer.rs`, and percentile stats plus an automated benchmark sweep in `src/bench.rs`.
-- Present mode and frame latency apply via surface reconfigure; backend, adapter, and DX12 compiler changes rebuild the renderer on the same window.
+- Present mode and frame latency apply via surface reconfigure; backend, adapter, and DX12 compiler changes rebuild the renderer, reusing the window except when leaving GL (see the third invariant below).
 - Benchmark sweeps save JSON to `benchmarks/` (gitignored). Headless: set `PST_AUTO_BENCH=warmup,measure` and optionally `PST_AUTO_BENCH_SHADER=path` — the app sweeps and exits on its own.
 - Two host invariants learned from the first sweeps: never request surface usages the capabilities don't list (GL lacks `COPY_SRC`; `Surface::configure` panics), and every `about_to_wait` path must request a redraw or the Wait-driven event loop parks before the first frame.
+- Third host invariant (2026-06-12): WGL permanently sets the HWND pixel format, so DXGI refuses swapchain creation on any window the GL backend has used (`E_ACCESSDENIED`). Rebuilding away from GL therefore replaces the native window in `apply_pending_rebuild`, and `init_renderer` wraps `Surface::configure` in an error scope so failed swaps revert instead of panicking. Standalone repro: `examples/backend_swap_probe.rs`.

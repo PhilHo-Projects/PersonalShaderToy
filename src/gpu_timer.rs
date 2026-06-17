@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 const MAX_PASSES: u32 = 16;
 const RING_SIZE: usize = 4;
 
-/// GPU timings for one frame, in pass-encoding order.
+/// GPU timings for one frame, in pass-encoding order. The frame total is
+/// reported separately through `begin_frame`'s return value.
 #[derive(Debug, Clone)]
 pub struct FrameGpuTiming {
     pub pass_ms: Vec<f64>,
-    pub total_ms: f64,
 }
 
 pub struct GpuTimer {
@@ -91,9 +91,8 @@ impl GpuTimer {
                     let delta_ns = end.saturating_sub(begin) as f64 * self.period_ns as f64;
                     pass_ms.push(delta_ns / 1_000_000.0);
                 }
-                let total_ms = pass_ms.iter().sum();
-                new_totals.push(total_ms);
-                self.latest = Some(FrameGpuTiming { pass_ms, total_ms });
+                new_totals.push(pass_ms.iter().sum());
+                self.latest = Some(FrameGpuTiming { pass_ms });
                 self.free_slots.push(slot);
             }
         }

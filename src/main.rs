@@ -49,6 +49,15 @@ const SCREENSHOT_DIR: &str = "target/native-captures";
 /// Rolling frame-time window for live percentile stats (~10s at 60fps).
 const STATS_HISTORY: usize = 600;
 
+/// Shared by the first init and the window replacement that a rebuild away
+/// from the GL backend requires (see apply_pending_rebuild).
+fn preview_window_attributes() -> WindowAttributes {
+    WindowAttributes::default()
+        .with_title("PersonalShaderToy Native Preview")
+        .with_min_inner_size(PhysicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
+        .with_inner_size(PhysicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // WGSL templates — matching the browser WebGPURenderer for shader compatibility
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1385,18 +1394,7 @@ impl PreviewApp {
         } else {
             Arc::new(
                 event_loop
-                    .create_window(
-                        WindowAttributes::default()
-                            .with_title("PersonalShaderToy Native Preview")
-                            .with_min_inner_size(PhysicalSize::new(
-                                MIN_WINDOW_WIDTH,
-                                MIN_WINDOW_HEIGHT,
-                            ))
-                            .with_inner_size(PhysicalSize::new(
-                                DEFAULT_WINDOW_WIDTH,
-                                DEFAULT_WINDOW_HEIGHT,
-                            )),
-                    )
+                    .create_window(preview_window_attributes())
                     .map_err(|e| e.to_string())?,
             )
         };
@@ -1509,7 +1507,19 @@ impl PreviewApp {
             view_formats: vec![],
         };
         self.active_present_mode = config.present_mode;
+        // Surface::configure reports failures through the device error sink
+        // (fatal panic by default) instead of a Result. Capture them in an
+        // error scope so a backend that cannot drive this window — e.g. DXGI
+        // refusing a swapchain on a GL-tainted HWND — comes back as Err and
+        // the rebuild revert path can recover instead of aborting the app.
+        let configure_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
+        if let Some(error) = pollster::block_on(configure_scope.pop()) {
+            return Err(format!(
+                "Surface configuration failed on {:?}: {error}",
+                adapter_info.backend
+            ));
+        }
 
         // ── Single-pass layout (1 uniform buffer) ──
 
@@ -1831,13 +1841,19 @@ impl PreviewApp {
                     }
                 }
 
+                // Pre-render-lab this answered "requires restarting the
+                // sidecar"; now it rides the same rebuild path as the UI.
                 SidecarCommand::SetBackend { backend } => {
-                    emit(&SidecarEvent::Diagnostic {
-                        level: "error",
-                        message: format!(
-                            "Backend change to '{backend}' requires restarting the sidecar."
+                    let mut new_settings = self.settings.clone();
+                    new_settings.backend = BackendChoice::parse(Some(backend.as_str()));
+                    self.push_diagnostic(
+                        DiagLevel::Info,
+                        format!(
+                            "Backend change to {} requested via sidecar.",
+                            new_settings.backend.label()
                         ),
-                    });
+                    );
+                    self.pending_rebuild = Some(new_settings);
                 }
 
                 #[allow(non_snake_case)]
@@ -4053,6 +4069,33 @@ impl PreviewApp {
         // Drop the old wgpu state (instance/surface/device/queue/egui_renderer).
         // The window is preserved on `self.window` so init_renderer reuses it.
         self.renderer = None;
+        // Exception: leaving the GL backend on Windows. WGL permanently sets
+        // the HWND's pixel format on first use, after which DXGI refuses to
+        // create a swapchain on that window (E_ACCESSDENIED) — verified by
+        // examples/backend_swap_probe.rs. Replace the window so the next
+        // backend starts on a clean HWND, keeping the old size and position.
+        if cfg!(target_os = "windows") && self.active_backend_name == "Gl" {
+            if let Some(old_window) = self.window.take() {
+                let mut attrs = preview_window_attributes()
+                    .with_inner_size(old_window.inner_size())
+                    .with_maximized(old_window.is_maximized());
+                if let Ok(position) = old_window.outer_position() {
+                    attrs = attrs.with_position(position);
+                }
+                drop(old_window);
+                match event_loop.create_window(attrs) {
+                    Ok(window) => self.window = Some(Arc::new(window)),
+                    // Leave self.window empty; init_renderer then creates a
+                    // default window instead.
+                    Err(error) => self.push_diagnostic(
+                        DiagLevel::Warning,
+                        format!(
+                            "Could not replace the window after OpenGL ({error}); creating a default window."
+                        ),
+                    ),
+                }
+            }
+        }
         // Force a temporal/state reset: ping-pong textures will be recreated
         // on the new device, so any feedback history is gone anyway.
         self.temporal_reset_pending = true;

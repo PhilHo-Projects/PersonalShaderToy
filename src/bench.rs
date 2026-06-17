@@ -207,6 +207,8 @@ impl BenchRunner {
         }
     }
 
+    /// The host tracks activity by dropping the runner; only tests query it.
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         !matches!(self.phase, Phase::Done)
     }
