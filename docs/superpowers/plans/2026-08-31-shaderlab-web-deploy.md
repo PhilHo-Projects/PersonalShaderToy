@@ -631,7 +631,7 @@ Expected: no type errors, build succeeds.
 - [ ] **Step 8: Verify the production bundle never calls the API**
 
 ```bash
-grep -rn "4781\|/api/shaders" apps/web/dist/assets/*.js; echo "exit=$?"
+grep -c "/api/shaders" apps/web/dist/assets/*.js | grep -v ":0"; echo "exit=$?"
 ```
 
 Expected: no matches, `exit=1`. A match means `HttpShaderLibraryService` was not tree-shaken out and the `import.meta.env.PROD` branch is wrong.

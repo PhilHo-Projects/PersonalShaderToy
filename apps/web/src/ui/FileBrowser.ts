@@ -3,6 +3,8 @@ import type { ShaderListing, ShaderFile } from '../types/shader.js';
 export interface FileBrowserCallbacks {
   onFileSelect: (provider: string, filename: string) => void;
   onRefresh: () => void;
+  hasOverride?: (provider: string, filename: string) => boolean;
+  onRevert?: (provider: string, filename: string) => void;
 }
 
 const PROVIDER_ICONS: Record<string, string> = {
@@ -65,9 +67,27 @@ export class FileBrowser {
     }
   }
 
+  /**
+   * A failed manifest fetch must not look like an empty library — a broken
+   * deploy has to be visibly broken.
+   */
+  renderError(message: string) {
+    const tree = this.el.querySelector('.fb-tree')!;
+    tree.innerHTML = '';
+    this.sections.clear();
+    this.activeItem = null;
+
+    const error = document.createElement('div');
+    error.className = 'fb-error';
+    error.textContent = message;
+    tree.appendChild(error);
+  }
+
   private createFileItem(file: ShaderFile): HTMLElement {
     const item = document.createElement('div');
     item.className = 'fb-file';
+    item.dataset.provider = file.provider;
+    item.dataset.filename = file.name;
     const typeColor = file.type === 'glsl' ? '#a6e3a1' : file.type === 'wgsl' ? '#89b4fa' : '#fab387';
     item.innerHTML = `<span class="fb-file-type" style="color:${typeColor}">${file.type}</span>
       <span class="fb-file-name">${file.name}</span>`;
@@ -77,7 +97,51 @@ export class FileBrowser {
       this.activeItem = item;
       this.cb.onFileSelect(file.provider, file.name);
     });
+
+    if (this.cb.hasOverride?.(file.provider, file.name)) {
+      this.attachRevert(item, file.provider, file.name);
+    }
+
     return item;
+  }
+
+  markOverride(provider: string, filename: string) {
+    const item = this.findItem(provider, filename);
+    if (item) this.attachRevert(item, provider, filename);
+  }
+
+  clearOverrideMark(provider: string, filename: string) {
+    const item = this.findItem(provider, filename);
+    if (!item) return;
+    item.classList.remove('edited');
+    item.querySelector('.fb-revert')?.remove();
+  }
+
+  private attachRevert(item: HTMLElement, provider: string, filename: string) {
+    if (item.querySelector('.fb-revert')) return;
+    item.classList.add('edited');
+
+    const btn = document.createElement('button');
+    btn.className = 'fb-revert';
+    btn.title = 'Discard your edits and restore the original shader';
+    btn.textContent = '↺';
+    btn.addEventListener('click', (e) => {
+      // Without this the click also selects the file and reloads the override.
+      e.stopPropagation();
+      this.cb.onRevert?.(provider, filename);
+    });
+    item.appendChild(btn);
+  }
+
+  private findItem(provider: string, filename: string): HTMLElement | null {
+    const list = this.sections.get(provider);
+    if (!list) return null;
+    for (const child of Array.from(list.children)) {
+      if ((child as HTMLElement).dataset.filename === filename) {
+        return child as HTMLElement;
+      }
+    }
+    return null;
   }
 
   addFile(provider: string, filename: string) {

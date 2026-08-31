@@ -4,6 +4,7 @@ import { ShaderEditor } from './editor/ShaderEditor.js';
 import { computeUniforms } from './renderer/uniforms.js';
 import { BrowserPreviewHost } from './services/BrowserPreviewHost.js';
 import { HttpShaderLibraryService } from './services/HttpShaderLibraryService.js';
+import { StaticShaderLibraryService } from './services/StaticShaderLibraryService.js';
 import { LocalStorageSettingsStore } from './services/LocalStorageSettingsStore.js';
 import type { PreviewHost, PreviewHostStatus } from './services/PreviewHost.js';
 import type { ShaderLibraryService } from './services/ShaderLibraryService.js';
@@ -52,7 +53,12 @@ function sanitizeBackend(value: string | null | undefined): PreviewBackend {
 }
 
 const settings = new LocalStorageSettingsStore();
-const shaderLibrary: ShaderLibraryService = new HttpShaderLibraryService();
+const shaderLibrary: ShaderLibraryService = import.meta.env.PROD
+  ? new StaticShaderLibraryService()
+  : new HttpShaderLibraryService();
+
+// Only the static library carries per-visitor overrides; in dev, saves go to disk.
+const overrideStore = shaderLibrary instanceof StaticShaderLibraryService ? shaderLibrary : null;
 
 const initialRenderPreset = getRenderPreset(settings.get('render-preset', 'full-hd'));
 const initialBackend = sanitizeBackend(settings.get('preview-backend', 'auto'));
@@ -100,6 +106,22 @@ const toolbar = new Toolbar({
 
 const fileBrowser = new FileBrowser({
   onRefresh: () => refreshShaderLibrary(),
+  hasOverride: (provider, filename) => overrideStore?.hasOverride(provider, filename) ?? false,
+  onRevert: async (provider, filename) => {
+    if (!overrideStore) return;
+    overrideStore.clearOverride(provider, filename);
+    fileBrowser.clearOverrideMark(provider, filename);
+    try {
+      const data = await shaderLibrary.load(provider, filename);
+      session.setCurrentFile({ provider, filename });
+      state.currentFile = { provider, filename };
+      toolbar.setActiveType(data.type);
+      await applyDocument(data.content, data.type);
+      outputPanel.log(`Reverted ${provider}/${filename} to the original`, 'info');
+    } catch {
+      outputPanel.log(`Failed to reload ${provider}/${filename}`, 'error');
+    }
+  },
   onFileSelect: async (provider, filename) => {
     try {
       const data = await shaderLibrary.load(provider, filename);
@@ -261,6 +283,7 @@ async function refreshShaderLibrary() {
     const data = await shaderLibrary.list();
     fileBrowser.render(data);
   } catch {
+    fileBrowser.renderError('Could not load the shader library.');
     outputPanel.log('Failed to refresh shader library.', 'error');
   }
 }
@@ -371,10 +394,17 @@ async function saveCurrentShader() {
     return;
   }
 
+  const { provider, filename } = state.currentFile;
+
   try {
-    await shaderLibrary.save(state.currentFile.provider, state.currentFile.filename, session.getSerializedSource());
+    await shaderLibrary.save(provider, filename, session.getSerializedSource());
+    if (overrideStore) {
+      fileBrowser.markOverride(provider, filename);
+      outputPanel.log(`Saved ${provider}/${filename} to this browser`, 'info');
+    }
   } catch {
-    outputPanel.log(`Failed to save ${state.currentFile.provider}/${state.currentFile.filename}`, 'error');
+    // Quota exceeded or storage refused; the edit is still live in the editor.
+    outputPanel.log(`Failed to save ${provider}/${filename}`, 'error');
   }
 }
 
