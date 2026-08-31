@@ -1,0 +1,16 @@
+.git
+.gitignore
+.claude
+.playwright-mcp
+**/node_modules
+**/dist
+apps/web/public/shaders
+benchmarks
+target
+src
+examples
+docs
+Cargo.toml
+Cargo.lock
+*.png
+*.md
