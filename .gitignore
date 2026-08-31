@@ -12,3 +12,4 @@ build_error.txt
 temp_err.txt
 
 /benchmarks/
+apps/web/public/shaders/

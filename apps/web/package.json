@@ -6,6 +6,7 @@
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
+    "prebuild": "node scripts/build-shader-manifest.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -13,7 +14,6 @@
     "chokidar": "^4.0.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "naga-wasm": "^1.0.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

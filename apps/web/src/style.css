@@ -595,3 +595,30 @@ html, body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+.fb-file.edited .fb-file-name::after {
+  content: "\2022";
+  color: var(--warning);
+  margin-left: 6px;
+}
+
+.fb-revert {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.fb-revert:hover { color: var(--warning); }
+.fb-file.active .fb-revert { color: var(--bg-primary); }
+
+.fb-error {
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--error);
+}
