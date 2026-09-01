@@ -9,6 +9,7 @@
 - Docs refresh for the post-Tauri direction: `complete`
 - Standalone native app (`winit + egui + wgpu`): `active`
 - Standalone browser app split into `apps/web`: `complete`
+- Browser app hosted as a public static site: `complete`
 - Integrated single-window native workflow split (`Load Shaders` + `Create Shader`): `complete`
 - Preview-only loading flow for large shaders: `complete`
 - Explicit create/edit flow with manual `Compile` and `Save`: `complete`
@@ -72,6 +73,18 @@
   - Sidecar `set_backend` now drives the same live rebuild path as the UI instead of replying "requires restarting the sidecar".
   - Hygiene: removed the unread `FrameGpuTiming::total_ms` field, gated `BenchRunner::is_active` to tests; `cargo check` is warning-free again.
 - Verification: scripted stdin run Dx12 → Gl → Dx12 exits 0 with three `WindowReady` events; quick headless sweep (`PST_AUTO_BENCH=0.5,1`) across DX12/Vulkan/GL still completes and saves JSON; `cargo test` 19 passed.
+
+### 2026-08-31 — Browser app deployed as a public static site
+
+- `apps/web` now ships as a static bundle at `https://shaderlab.philippeho.dev`, hosted as a Coolify Docker application (nginx on port 8000, manual releases, no webhook).
+- Added `apps/web/scripts/build-shader-manifest.mjs`, a `prebuild` step copying the root `shaders/` corpus into `public/shaders/` alongside a `manifest.json` matching the shape `ShaderLibraryService.list()` already returns.
+- Added `StaticShaderLibraryService`: lists and loads over plain fetch, keeps visitor edits in `localStorage` under `pst:shader:<provider>/<filename>`, and does no file watching. `main.ts` selects it via `import.meta.env.PROD`; dev keeps the Express-backed service untouched.
+- Because `load()` prefers a local override, edited files now show a revert control; without it a visitor who saved a broken shader would be stuck with it permanently.
+- A failed manifest fetch renders an error in the file browser rather than an empty tree, so a broken deploy is visibly broken.
+- The Docker build context is the repository root, not `apps/web` — the manifest script reads `../../../shaders`, which sits above the web app.
+- The repository was made public; the tracked instruction files and their full history were scrubbed of infrastructure details first.
+- Dropped `naga-wasm`, which was declared but never imported.
+- The corpus is 19 shaders across 6 providers; `shaders/User/` is empty by design and is skipped by the manifest.
 
 ### 2026-06-12 — Render lab: settings, GPU timing, benchmark sweep
 

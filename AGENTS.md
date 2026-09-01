@@ -55,3 +55,12 @@ This file mirrors `CLAUDE.md`. Keep both files synchronized.
 - Benchmark sweeps save JSON to `benchmarks/` (gitignored). Headless: set `PST_AUTO_BENCH=warmup,measure` and optionally `PST_AUTO_BENCH_SHADER=path` — the app sweeps and exits on its own.
 - Two host invariants learned from the first sweeps: never request surface usages the capabilities don't list (GL lacks `COPY_SRC`; `Surface::configure` panics), and every `about_to_wait` path must request a redraw or the Wait-driven event loop parks before the first frame.
 - Third host invariant (2026-06-12): WGL permanently sets the HWND pixel format, so DXGI refuses swapchain creation on any window the GL backend has used (`E_ACCESSDENIED`). Rebuilding away from GL therefore replaces the native window in `apply_pending_rebuild`, and `init_renderer` wraps `Surface::configure` in an error scope so failed swaps revert instead of panicking. Standalone repro: `examples/backend_swap_probe.rs`.
+
+## Web Deployment
+
+- `apps/web/` is deployed as a static site at `https://shaderlab.philippeho.dev`, a Coolify `dockerfile` application with manual releases and no webhook.
+- The Docker build context is the repository root: `base_directory: /` and `dockerfile_location: /apps/web/Dockerfile`. It cannot be `/apps/web`, because `apps/web/scripts/build-shader-manifest.mjs` reads `../../../shaders`.
+- Production uses `StaticShaderLibraryService`. The shader corpus is baked in at build time and visitor edits live only in that visitor's `localStorage`.
+- `apps/web/server/` and `HttpShaderLibraryService` are development-only and must never be exposed. The server's `POST /api/shaders/:provider/:filename` route has no authentication and no path sanitisation on `filename`.
+- The hosted app intentionally diverges from the native lab: WebGL2/WebGPU only, with no adapter picker, present-mode or frame-latency control, DX12 compiler choice, per-pass GPU timing, or benchmark sweep.
+- This repository is public. Never commit server addresses, SSH details, credentials, or secret names to tracked files.
