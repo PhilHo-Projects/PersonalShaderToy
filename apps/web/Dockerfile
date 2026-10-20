@@ -1,6 +1,6 @@
 # Build context is the REPOSITORY ROOT, not apps/web. The shader corpus at
 # shaders/ sits above the web app and must be copied into the build.
-FROM node:22-alpine AS build
+FROM node:22.23.3-alpine AS build
 
 WORKDIR /build
 
@@ -13,7 +13,7 @@ COPY shaders ./shaders
 # Triggers the prebuild step, which emits public/shaders/ from ../../../shaders.
 RUN cd apps/web && npm run build
 
-FROM nginx:alpine
+FROM nginx:1.31.7-alpine
 
 COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /build/apps/web/dist /usr/share/nginx/html
