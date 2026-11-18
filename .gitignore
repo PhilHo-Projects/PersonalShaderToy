@@ -13,3 +13,7 @@ temp_err.txt
 
 /benchmarks/
 apps/web/public/shaders/
+
+apps/web/public/compilers/
+apps/web/public/.catalog-*/
+__pycache__/

@@ -51,7 +51,11 @@ impl FrameStats {
     }
 
     pub fn avg_fps(&self) -> f64 {
-        if self.avg_ms > 0.0 { 1000.0 / self.avg_ms } else { 0.0 }
+        if self.avg_ms > 0.0 {
+            1000.0 / self.avg_ms
+        } else {
+            0.0
+        }
     }
 
     pub fn low_1pct_fps(&self) -> f64 {
@@ -72,7 +76,8 @@ pub struct RunRecord {
     pub present_mode: String,
     pub resolution: [u32; 2],
     pub frames: u32,
-    pub cpu: Option<FrameStats>,
+    #[serde(rename = "frame_interval", alias = "cpu")]
+    pub frame_interval: Option<FrameStats>,
     pub gpu: Option<FrameStats>,
     pub pipeline_compile_ms: Option<f64>,
     /// Set when the backend failed to init or compile; stats fields are None.
@@ -82,6 +87,10 @@ pub struct RunRecord {
 /// A full benchmark sweep over multiple backends for one shader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepResult {
+    #[serde(default)]
+    pub warmup_frames: u32,
+    #[serde(default)]
+    pub fixed_step_seconds: Option<f64>,
     pub shader: String,
     pub timestamp_unix: u64,
     pub warmup_secs: f64,
@@ -191,6 +200,9 @@ pub struct BenchRunner {
     config: BenchConfig,
     phase: Phase,
     runs: Vec<RunRecord>,
+    warmup_count: u32,
+    baseline_warmup: Option<u32>,
+    baseline_measure: Option<u32>,
 }
 
 impl BenchRunner {
@@ -204,6 +216,9 @@ impl BenchRunner {
             config,
             phase,
             runs: Vec::new(),
+            warmup_count: 0,
+            baseline_warmup: None,
+            baseline_measure: None,
         }
     }
 
@@ -244,6 +259,7 @@ impl BenchRunner {
         pipeline_compile_ms: Option<f64>,
     ) {
         if let Phase::WaitingReady(i) = self.phase {
+            self.warmup_count = 0;
             self.phase = Phase::Warmup {
                 index: i,
                 started: now,
@@ -269,7 +285,7 @@ impl BenchRunner {
                 present_mode: String::new(),
                 resolution: [0, 0],
                 frames: 0,
-                cpu: None,
+                frame_interval: None,
                 gpu: None,
                 pipeline_compile_ms: None,
                 error: Some(reason),
@@ -281,14 +297,21 @@ impl BenchRunner {
     /// Feed one completed frame. Warmup frames are dropped; the frame that
     /// crosses into the measure window is the first counted sample; the frame
     /// that crosses past the window finalizes the run without being counted.
-    pub fn record_frame(&mut self, now: f64, cpu_ms: f64, gpu_ms: Option<f64>) {
+    pub fn record_frame(&mut self, now: f64, cpu_ms: f64, gpu_ms: impl IntoIterator<Item = f64>) {
         match &mut self.phase {
             Phase::Warmup {
                 index,
                 started,
                 meta,
             } => {
-                if now - *started >= self.config.warmup_secs {
+                self.warmup_count += 1;
+                if self
+                    .baseline_warmup
+                    .map_or(now - *started >= self.config.warmup_secs, |n| {
+                        self.warmup_count >= n
+                    })
+                {
+                    self.baseline_warmup.get_or_insert(self.warmup_count);
                     self.phase = Phase::Measuring {
                         index: *index,
                         started: now,
@@ -307,14 +330,18 @@ impl BenchRunner {
                 gpu_ms: gpu,
                 frames,
             } => {
-                if now - *started >= self.config.measure_secs {
+                if self
+                    .baseline_measure
+                    .map_or(now - *started >= self.config.measure_secs, |n| *frames >= n)
+                {
+                    self.baseline_measure.get_or_insert(*frames);
                     let record = RunRecord {
                         backend: meta.backend.clone(),
                         adapter: meta.adapter.clone(),
                         present_mode: meta.present_mode.clone(),
                         resolution: meta.resolution,
                         frames: *frames,
-                        cpu: FrameStats::from_samples_ms(cpu),
+                        frame_interval: FrameStats::from_samples_ms(cpu),
                         gpu: FrameStats::from_samples_ms(gpu),
                         pipeline_compile_ms: meta.pipeline_compile_ms,
                         error: None,
@@ -324,9 +351,7 @@ impl BenchRunner {
                     self.advance(i);
                 } else {
                     cpu.push(cpu_ms);
-                    if let Some(g) = gpu_ms {
-                        gpu.push(g);
-                    }
+                    gpu.extend(gpu_ms);
                     *frames += 1;
                 }
             }
@@ -342,6 +367,8 @@ impl BenchRunner {
         }
         self.phase = Phase::Done;
         Some(SweepResult {
+            warmup_frames: self.baseline_warmup.unwrap_or(0).saturating_sub(1),
+            fixed_step_seconds: Some(1. / 60.),
             shader,
             timestamp_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -383,20 +410,6 @@ impl BenchRunner {
             Phase::PendingFinish
         };
     }
-}
-
-/// Saved sweeps in `dir`, newest first (file names end in a unix timestamp).
-pub fn list_sweeps(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    files
 }
 
 #[cfg(test)]
@@ -452,6 +465,8 @@ mod tests {
     #[test]
     fn sweep_result_json_round_trip() {
         let result = SweepResult {
+            warmup_frames: 0,
+            fixed_step_seconds: None,
             shader: "test5.wgsl".into(),
             timestamp_unix: 1_750_000_000,
             warmup_secs: 3.0,
@@ -462,7 +477,7 @@ mod tests {
                 present_mode: "Immediate".into(),
                 resolution: [1280, 720],
                 frames: 1200,
-                cpu: FrameStats::from_samples_ms(&[8.0, 9.0, 10.0]),
+                frame_interval: FrameStats::from_samples_ms(&[8.0, 9.0, 10.0]),
                 gpu: None,
                 pipeline_compile_ms: Some(42.5),
                 error: None,
@@ -472,7 +487,7 @@ mod tests {
         let back: SweepResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back.runs.len(), 1);
         assert_eq!(back.runs[0].backend, "Vulkan");
-        assert_eq!(back.runs[0].cpu.as_ref().unwrap().count, 3);
+        assert_eq!(back.runs[0].frame_interval.as_ref().unwrap().count, 3);
     }
 
     #[test]
@@ -536,6 +551,8 @@ mod tests {
         r.record_frame(5.1, 5.0, None);
         r.record_frame(5.5, 5.0, None);
         r.record_frame(7.2, 5.0, None);
+        r.record_frame(7.3, 5.0, None);
+        r.record_frame(7.4, 5.0, None);
 
         assert!(matches!(r.next_action(), BenchAction::Finished));
         let result = r.take_result("shader.wgsl".into()).unwrap();
@@ -544,7 +561,7 @@ mod tests {
         assert_eq!(dx.backend, "Dx12");
         assert_eq!(dx.present_mode, "Immediate");
         assert_eq!(dx.frames, 3);
-        assert_eq!(dx.cpu.as_ref().unwrap().count, 3);
+        assert_eq!(dx.frame_interval.as_ref().unwrap().count, 3);
         // GPU samples: only 2 of the 3 measured frames had Some.
         assert_eq!(dx.gpu.as_ref().unwrap().count, 2);
         assert_eq!(dx.pipeline_compile_ms, Some(10.0));
@@ -565,7 +582,14 @@ mod tests {
             panic!()
         };
         assert_eq!(label, "Vulkan");
-        r.backend_ready(0.0, "Vulkan".into(), "GPU".into(), "Fifo".into(), [64, 64], None);
+        r.backend_ready(
+            0.0,
+            "Vulkan".into(),
+            "GPU".into(),
+            "Fifo".into(),
+            [64, 64],
+            None,
+        );
         r.record_frame(1.5, 5.0, None);
         r.record_frame(1.7, 5.0, None);
         r.record_frame(3.6, 5.0, None);
@@ -573,7 +597,7 @@ mod tests {
         assert!(matches!(r.next_action(), BenchAction::Finished));
         let result = r.take_result("s".into()).unwrap();
         assert_eq!(result.runs[0].error.as_deref(), Some("no adapter"));
-        assert!(result.runs[0].cpu.is_none());
+        assert!(result.runs[0].frame_interval.is_none());
         assert!(result.runs[1].error.is_none());
     }
 
@@ -593,6 +617,8 @@ mod tests {
     fn save_and_load_sweep() {
         let dir = std::env::temp_dir().join(format!("pst-bench-{}", std::process::id()));
         let result = SweepResult {
+            warmup_frames: 0,
+            fixed_step_seconds: None,
             shader: "t.wgsl".into(),
             timestamp_unix: 42,
             warmup_secs: 1.0,
@@ -604,4 +630,115 @@ mod tests {
         assert_eq!(loaded.timestamp_unix, 42);
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+pub fn render_table(ui: &mut egui::Ui, runs: &[RunRecord]) {
+    let best_color = egui::Color32::from_rgb(145, 205, 145);
+    let cell_color = egui::Color32::from_rgb(200, 200, 200);
+    let err_color = egui::Color32::from_rgb(255, 90, 90);
+
+    let comparable = runs.iter().filter(|r| r.error.is_none()).all(|r| {
+        runs.iter().filter(|x| x.error.is_none()).all(|x| {
+            x.adapter.split("/PCIe").next() == r.adapter.split("/PCIe").next()
+                && x.resolution == r.resolution
+                && x.present_mode == r.present_mode
+                && x.frames == r.frames
+        })
+    });
+    let best_fps_idx = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, run)| run.frame_interval.as_ref().map(|c| (i, c.avg_fps())))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(i, _)| i);
+    let best_p95_idx = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, run)| run.frame_interval.as_ref().map(|c| (i, c.p95_ms)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(i, _)| i);
+
+    let cell = |text: String, highlight: bool| {
+        egui::RichText::new(text)
+            .size(10.5)
+            .color(if highlight { best_color } else { cell_color })
+    };
+
+    egui::Grid::new("bench_results_grid")
+        .striped(true)
+        .min_col_width(52.0)
+        .show(ui, |ui| {
+            ui.label(cell(String::new(), false));
+            for run in runs {
+                ui.label(
+                    egui::RichText::new(&run.backend)
+                        .size(10.5)
+                        .strong()
+                        .color(cell_color),
+                );
+            }
+            ui.end_row();
+
+            type RowFn = fn(&RunRecord) -> Option<String>;
+            let rows: [(&str, RowFn); 8] = [
+                ("mode", |r| Some(r.present_mode.clone())),
+                ("avg fps", |r| {
+                    r.frame_interval
+                        .as_ref()
+                        .map(|c| format!("{:.0}", c.avg_fps()))
+                }),
+                ("avg ms", |r| {
+                    r.frame_interval
+                        .as_ref()
+                        .map(|c| format!("{:.2}", c.avg_ms))
+                }),
+                ("p95 ms", |r| {
+                    r.frame_interval
+                        .as_ref()
+                        .map(|c| format!("{:.2}", c.p95_ms))
+                }),
+                ("p99 ms", |r| {
+                    r.frame_interval
+                        .as_ref()
+                        .map(|c| format!("{:.2}", c.p99_ms))
+                }),
+                ("1% low fps", |r| {
+                    r.frame_interval
+                        .as_ref()
+                        .map(|c| format!("{:.0}", c.low_1pct_fps()))
+                }),
+                ("gpu avg ms", |r| {
+                    r.gpu.as_ref().map(|g| format!("{:.2}", g.avg_ms))
+                }),
+                ("compile ms", |r| {
+                    r.pipeline_compile_ms.map(|ms| format!("{ms:.1}"))
+                }),
+            ];
+
+            for (label, value_fn) in rows {
+                ui.label(cell(label.to_string(), false));
+                for (i, run) in runs.iter().enumerate() {
+                    let highlight = (label == "avg fps" && Some(i) == best_fps_idx)
+                        || (label == "p95 ms" && Some(i) == best_p95_idx);
+                    let text = value_fn(run).unwrap_or_else(|| "—".to_string());
+                    ui.label(cell(text, comparable && highlight));
+                }
+                ui.end_row();
+            }
+
+            // Status row: ok / error (full reason on hover).
+            ui.label(cell("status".to_string(), false));
+            for run in runs {
+                match &run.error {
+                    Some(reason) => {
+                        ui.label(egui::RichText::new("✖ failed").size(10.5).color(err_color))
+                            .on_hover_text(reason);
+                    }
+                    None => {
+                        ui.label(cell(format!("{} frames", run.frames), false));
+                    }
+                }
+            }
+            ui.end_row();
+        });
 }

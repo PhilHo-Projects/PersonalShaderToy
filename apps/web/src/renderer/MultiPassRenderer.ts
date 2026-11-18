@@ -1,6 +1,6 @@
-import type { Uniforms } from './uniforms.js';
-import type { ParsedPass } from './shaderParser.js';
-import { RenderTarget } from './RenderTarget.js';
+import type { Uniforms } from "./uniforms.js";
+import type { ParsedPass } from "./uniforms.js";
+import { RenderTarget } from "./RenderTarget.js";
 
 const VERTEX_SHADER = `#version 300 es
 void main() {
@@ -52,10 +52,16 @@ interface PassProgram {
 
 export class MultiPassRenderer {
   private gl: WebGL2RenderingContext;
+  private blank: WebGLTexture;
   private vao: WebGLVertexArrayObject;
   private vsShader: WebGLShader | null = null;
   private passes: PassProgram[] = [];
   private renderTargets = new Map<string, RenderTarget>();
+  timings: number[] | null = null;
+  private timer: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null;
+  private queries: WebGLQuery[] = [];
+  private output: WebGLFramebuffer | null = null;
+  private color: WebGLTexture | null = null;
   private width = 0;
   private height = 0;
   private keyboardTexture: WebGLTexture | null = null;
@@ -63,17 +69,29 @@ export class MultiPassRenderer {
   private keyboardData = new Uint8Array(256 * 3 * 4); // 256 wide, 3 rows, RGBA
 
   constructor(public canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
-    if (!gl) throw new Error('WebGL2 not supported');
+    const gl = canvas.getContext("webgl2", {
+      antialias: false,
+      preserveDrawingBuffer: true,
+    });
+    if (!gl) throw new Error("WebGL2 not supported");
     this.gl = gl;
+    this.timer = gl.getExtension("EXT_disjoint_timer_query_webgl2");
 
-    // Enable float textures (needed for RGBA32F render targets)
-    const ext = gl.getExtension('EXT_color_buffer_float');
-    if (!ext) console.warn('EXT_color_buffer_float not available — multi-pass may not work');
-
-    // Enable linear filtering of float textures (needed for texture() on RGBA32F)
-    const floatLinear = gl.getExtension('OES_texture_float_linear');
-    if (!floatLinear) console.warn('OES_texture_float_linear not available — texture sampling on float buffers may fail');
+    this.blank = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.blank);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      1,
+      1,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      new Uint8Array([0, 0, 0, 255]),
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.bindTexture(gl.TEXTURE_2D, null);
 
     this.vao = gl.createVertexArray()!;
 
@@ -87,7 +105,11 @@ export class MultiPassRenderer {
   updateKeyboard(keys: Set<number>) {
     // Row 0: current key state
     for (let i = 0; i < 256; i++) {
-      this.keyboardData[i * 4] = keys.has(i) ? 255 : 0;
+      const k = i * 4,
+        down = keys.has(i) && !this.keyboardData[k];
+      this.keyboardData[1024 + k] = down ? 255 : 0;
+      if (down) this.keyboardData[2048 + k] ^= 255;
+      this.keyboardData[k] = keys.has(i) ? 255 : 0;
     }
   }
 
@@ -99,7 +121,22 @@ export class MultiPassRenderer {
     const gl = this.gl;
 
     // Compile all passes first before committing any state
-    const newPrograms: { name: string; program: WebGLProgram; channels: (string | null)[] }[] = [];
+    if (
+      parsedPasses.length > 1 &&
+      (!gl.getExtension("EXT_color_buffer_float") ||
+        !gl.getExtension("OES_texture_float_linear"))
+    ) {
+      return {
+        success: false,
+        errors:
+          "Floating-point buffer rendering and linear filtering are required for this shader.",
+      };
+    }
+    const newPrograms: {
+      name: string;
+      program: WebGLProgram;
+      channels: (string | null)[];
+    }[] = [];
 
     for (const pass of parsedPasses) {
       const result = this.compilePass(pass);
@@ -108,7 +145,11 @@ export class MultiPassRenderer {
         for (const p of newPrograms) gl.deleteProgram(p.program);
         return { success: false, errors: result.errors, passName: pass.name };
       }
-      newPrograms.push({ name: pass.name, program: result.program, channels: pass.channels });
+      newPrograms.push({
+        name: pass.name,
+        program: result.program,
+        channels: pass.channels,
+      });
     }
 
     // All passes compiled successfully — commit
@@ -117,19 +158,29 @@ export class MultiPassRenderer {
     // Create render targets for buffer passes
     const w = gl.drawingBufferWidth || 1;
     const h = gl.drawingBufferHeight || 1;
-    this.width = w;
-    this.height = h;
+    this.width = 0;
+    this.height = 0;
 
     // Detect if any pass uses keyboard input
-    this.hasKeyboardChannel = newPrograms.some(p =>
-      p.channels.some(c => c?.toLowerCase() === 'keyboard')
+    this.hasKeyboardChannel = newPrograms.some((p) =>
+      p.channels.some((c) => c?.toLowerCase() === "keyboard"),
     );
 
     // Create keyboard texture if needed
     if (this.hasKeyboardChannel && !this.keyboardTexture) {
       this.keyboardTexture = gl.createTexture()!;
       gl.bindTexture(gl.TEXTURE_2D, this.keyboardTexture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 3, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.keyboardData);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA8,
+        256,
+        3,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        this.keyboardData,
+      );
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -138,7 +189,7 @@ export class MultiPassRenderer {
     }
 
     this.passes = newPrograms.map(({ name, program, channels }) => {
-      const isImage = name.toLowerCase() === 'image';
+      const isImage = name.toLowerCase() === "image";
       let rt: RenderTarget | null = null;
 
       if (!isImage) {
@@ -148,9 +199,19 @@ export class MultiPassRenderer {
 
       // Cache uniform locations
       const locs = new Map<string, WebGLUniformLocation | null>();
-      for (const uname of ['iTime', 'iTimeDelta', 'iResolution', 'iChannelResolution',
-                           'iMouse', 'iFrame', 'iDate',
-                           'iChannel0', 'iChannel1', 'iChannel2', 'iChannel3']) {
+      for (const uname of [
+        "iTime",
+        "iTimeDelta",
+        "iResolution",
+        "iChannelResolution",
+        "iMouse",
+        "iFrame",
+        "iDate",
+        "iChannel0",
+        "iChannel1",
+        "iChannel2",
+        "iChannel3",
+      ]) {
         locs.set(uname, gl.getUniformLocation(program, uname));
       }
 
@@ -160,7 +221,10 @@ export class MultiPassRenderer {
     return { success: true };
   }
 
-  private compilePass(pass: ParsedPass): { program: WebGLProgram | null; errors?: string } {
+  private compilePass(pass: ParsedPass): {
+    program: WebGLProgram | null;
+    errors?: string;
+  } {
     const gl = this.gl;
     const source = pass.source;
 
@@ -173,11 +237,11 @@ export class MultiPassRenderer {
     if (hasVersion && hasMain) {
       fragSource = source;
     } else if (hasMainImage) {
-      fragSource = UNIFORM_HEADER + '\n' + source + '\n' + SHADERTOY_FOOTER;
+      fragSource = UNIFORM_HEADER + "\n" + source + "\n" + SHADERTOY_FOOTER;
     } else if (hasMain && !hasVersion) {
-      fragSource = UNIFORM_HEADER + '\n' + source;
+      fragSource = UNIFORM_HEADER + "\n" + source;
     } else {
-      fragSource = UNIFORM_HEADER + '\n' + source + '\n' + SHADERTOY_FOOTER;
+      fragSource = UNIFORM_HEADER + "\n" + source + "\n" + SHADERTOY_FOOTER;
     }
 
     // Compile fragment shader
@@ -185,11 +249,11 @@ export class MultiPassRenderer {
     gl.shaderSource(fs, fragSource);
     gl.compileShader(fs);
     if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
-      let err = gl.getShaderInfoLog(fs) || 'Fragment shader error';
+      let err = gl.getShaderInfoLog(fs) || "Fragment shader error";
       gl.deleteShader(fs);
       if (!hasVersion) {
-        const headerLines = UNIFORM_HEADER.split('\n').length;
-        err = adjustLineNumbers(err, headerLines);
+        const headerLines = UNIFORM_HEADER.split("\n").length;
+        err = adjustLineNumbers(err, headerLines - pass.line + 1);
       }
       return { program: null, errors: `[${pass.name}] ${err}` };
     }
@@ -202,7 +266,7 @@ export class MultiPassRenderer {
     gl.deleteShader(fs);
 
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      const err = gl.getProgramInfoLog(prog) || 'Link error';
+      const err = gl.getProgramInfoLog(prog) || "Link error";
       gl.deleteProgram(prog);
       return { program: null, errors: `[${pass.name}] ${err}` };
     }
@@ -211,16 +275,58 @@ export class MultiPassRenderer {
   }
 
   render(u: Uniforms) {
+    if (this.gl.isContextLost())
+      throw Error("WebGL context lost. Select a shader to restart playback.");
     const gl = this.gl;
     if (this.passes.length === 0) return;
 
-
+    if (this.timer && this.queries.length) {
+      const disjoint = gl.getParameter(this.timer.GPU_DISJOINT_EXT);
+      if (
+        disjoint ||
+        this.queries.every((q) =>
+          gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE),
+        )
+      ) {
+        this.timings = disjoint
+          ? null
+          : this.queries.map(
+              (q) => gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6,
+            );
+        this.queries.forEach((q) => gl.deleteQuery(q));
+        this.queries = [];
+      }
+    }
+    const sample = this.timer && !this.queries.length;
     // Resize render targets if canvas size changed
     const w = gl.drawingBufferWidth;
     const h = gl.drawingBufferHeight;
     if (w !== this.width || h !== this.height) {
       this.width = w;
       this.height = h;
+      if (!this.output) this.output = gl.createFramebuffer();
+      if (!this.color) this.color = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.color);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA8,
+        w,
+        h,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        null,
+      );
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.output);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        this.color,
+        0,
+      );
+      gl.bindTexture(gl.TEXTURE_2D, null);
       for (const rt of this.renderTargets.values()) {
         rt.resize(w, h);
       }
@@ -234,7 +340,7 @@ export class MultiPassRenderer {
         gl.bindFramebuffer(gl.FRAMEBUFFER, pass.renderTarget.writeFramebuffer);
         gl.viewport(0, 0, pass.renderTarget.width, pass.renderTarget.height);
       } else {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.output);
         gl.viewport(0, 0, w, h);
       }
 
@@ -242,28 +348,28 @@ export class MultiPassRenderer {
 
       // Bind standard uniforms
       const loc = (n: string) => pass.locs.get(n) ?? null;
-      gl.uniform1f(loc('iTime'), u.iTime);
-      gl.uniform1f(loc('iTimeDelta'), u.iTimeDelta);
-      gl.uniform3fv(loc('iResolution'), u.iResolution);
-      gl.uniform4fv(loc('iMouse'), u.iMouse);
-      gl.uniform1i(loc('iFrame'), u.iFrame);
-      gl.uniform4fv(loc('iDate'), u.iDate);
+      gl.uniform1f(loc("iTime"), u.iTime);
+      gl.uniform1f(loc("iTimeDelta"), u.iTimeDelta);
+      gl.uniform3fv(loc("iResolution"), u.iResolution);
+      gl.uniform4fv(loc("iMouse"), u.iMouse);
+      gl.uniform1i(loc("iFrame"), u.iFrame);
+      gl.uniform4fv(loc("iDate"), u.iDate);
 
       // Set iChannelResolution — all buffer targets share canvas resolution
-      const chanResLoc = loc('iChannelResolution');
+      const chanResLoc = loc("iChannelResolution");
       if (chanResLoc) {
         const res = u.iResolution;
         // keyboard texture is 256x3, buffer textures are canvas-sized
         const chanRes = new Float32Array(12);
         for (let i = 0; i < 4; i++) {
           const cn = pass.channels[i];
-          if (cn && cn.toLowerCase() === 'keyboard') {
+          if (cn && cn.toLowerCase() === "keyboard") {
             chanRes[i * 3] = 256;
             chanRes[i * 3 + 1] = 3;
             chanRes[i * 3 + 2] = 1;
           } else {
-            chanRes[i * 3] = res[0];
-            chanRes[i * 3 + 1] = res[1];
+            chanRes[i * 3] = cn ? res[0] : 1;
+            chanRes[i * 3 + 1] = cn ? res[1] : 1;
             chanRes[i * 3 + 2] = 1;
           }
         }
@@ -273,15 +379,28 @@ export class MultiPassRenderer {
       // Bind channel textures
       for (let i = 0; i < 4; i++) {
         const chanName = pass.channels[i];
-        if (!chanName) continue;
-
         gl.activeTexture(gl.TEXTURE0 + i);
+        if (!chanName) {
+          gl.bindTexture(gl.TEXTURE_2D, this.blank);
+          gl.uniform1i(loc(`iChannel${i}`), i);
+          continue;
+        }
 
-        if (chanName.toLowerCase() === 'keyboard') {
+        if (chanName.toLowerCase() === "keyboard") {
           // Upload latest keyboard state and bind
           if (this.keyboardTexture) {
             gl.bindTexture(gl.TEXTURE_2D, this.keyboardTexture);
-            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 3, gl.RGBA, gl.UNSIGNED_BYTE, this.keyboardData);
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              0,
+              0,
+              256,
+              3,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              this.keyboardData,
+            );
           }
           gl.uniform1i(loc(`iChannel${i}`), i);
           continue;
@@ -294,10 +413,14 @@ export class MultiPassRenderer {
         gl.uniform1i(loc(`iChannel${i}`), i);
       }
 
-
       // Draw
+      const query = sample ? gl.createQuery() : null;
+      if (query) gl.beginQuery(this.timer!.TIME_ELAPSED_EXT, query);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-
+      if (query) {
+        gl.endQuery(this.timer!.TIME_ELAPSED_EXT);
+        this.queries.push(query);
+      }
 
       // Swap ping-pong for buffer passes
       if (pass.renderTarget) {
@@ -310,6 +433,10 @@ export class MultiPassRenderer {
         gl.bindTexture(gl.TEXTURE_2D, null);
       }
     }
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.output);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   private disposePasses() {
@@ -324,7 +451,28 @@ export class MultiPassRenderer {
     this.renderTargets.clear();
   }
 
+  reset() {
+    this.timings = null;
+    this.queries.forEach((q) => this.gl.deleteQuery(q));
+    this.queries = [];
+    for (const pass of this.passes) {
+      if (!pass.renderTarget) continue;
+      pass.renderTarget.dispose();
+      pass.renderTarget = new RenderTarget(
+        this.gl,
+        this.canvas.width,
+        this.canvas.height,
+      );
+      this.renderTargets.set(pass.name, pass.renderTarget);
+    }
+  }
+
   dispose() {
+    this.queries.forEach((q) => this.gl.deleteQuery(q));
+    this.gl.deleteFramebuffer(this.output);
+    this.gl.deleteTexture(this.color);
+    this.gl.deleteVertexArray(this.vao);
+    this.gl.deleteTexture(this.blank);
     this.disposePasses();
     if (this.vsShader) {
       this.gl.deleteShader(this.vsShader);

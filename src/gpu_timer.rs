@@ -7,7 +7,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-const MAX_PASSES: u32 = 16;
 const RING_SIZE: usize = 4;
 
 /// GPU timings for one frame, in pass-encoding order. The frame total is
@@ -26,24 +25,29 @@ pub struct GpuTimer {
     free_slots: Vec<usize>,
     completed: Arc<Mutex<Vec<(usize, Vec<u64>)>>>,
     period_ns: f32,
+    capacity: u32,
     passes_this_frame: u32,
     latest: Option<FrameGpuTiming>,
 }
 
 impl GpuTimer {
     /// Returns None when the device lacks TIMESTAMP_QUERY (e.g. most GL).
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
-        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, passes: usize) -> Option<Self> {
+        let capacity = u32::try_from(passes).ok()?;
+        if capacity == 0
+            || capacity > wgpu::QUERY_SET_MAX_QUERIES / 2
+            || !device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
             return None;
         }
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("gpu-timer-queries"),
             ty: wgpu::QueryType::Timestamp,
-            count: MAX_PASSES * 2,
+            count: capacity * 2,
         });
         let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu-timer-resolve"),
-            size: (MAX_PASSES as u64 * 2) * 8,
+            size: (capacity as u64 * 2) * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -51,7 +55,7 @@ impl GpuTimer {
             .map(|i| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("gpu-timer-readback-{i}")),
-                    size: (MAX_PASSES as u64 * 2) * 8,
+                    size: (capacity as u64 * 2) * 8,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 })
@@ -65,6 +69,7 @@ impl GpuTimer {
             free_slots: (0..RING_SIZE).collect(),
             completed: Arc::new(Mutex::new(Vec::new())),
             period_ns: queue.get_timestamp_period(),
+            capacity,
             passes_this_frame: 0,
             latest: None,
         })
@@ -101,7 +106,7 @@ impl GpuTimer {
 
     /// Allocate begin/end query indices for the next shader pass this frame.
     pub fn pass_timestamp_writes(&mut self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        if self.passes_this_frame >= MAX_PASSES {
+        if self.passes_this_frame >= self.capacity {
             return None;
         }
         let base = self.passes_this_frame * 2;

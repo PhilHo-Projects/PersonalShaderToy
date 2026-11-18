@@ -1,62 +1,51 @@
-# Project Map
+# Project map
 
-## Canonical Entry Points
+## Run the viewers
 
-- Native desktop app:
-  - root `Cargo.toml`
-  - root `src/main.rs`
-- Standalone browser app:
-  - `apps/web/package.json`
-  - `apps/web/src/main.ts`
+From the repository root with Rust, Node 22 and Python 3.12 or later available:
 
-## Shared Surface
+```sh
+cargo run --release --locked -- --example Kerr
+cargo run --release --locked -- --open tests/fixtures/centering.wgsl
+npm --prefix apps/web ci --include=dev
+npm --prefix apps/web run dev
+```
 
-- The only intended shared runtime asset between native and web is `shaders/`.
-- Do not assume renderer, transpiler, preview-host, or platform code is shared across the two apps.
+The hosted viewer runs at [shaderlab.philippeho.dev](https://shaderlab.philippeho.dev). Vite serves the local viewer on port 5199. Select an example, open or drop a file, or use **Paste and run**. A native file stays attached to its location and recompiles when saved. In a browser, reopen or drop the revised file. **View code** opens the original source or HLSL for the active pass. **Copy shader** includes the multipass wiring.
 
-## Working Areas
+## Implementation
 
-- Native app code: `src/`
-  - `src/main.rs` — window shell, renderer, UI, shader pipeline
-  - `src/render_settings.rs` — backend/adapter/present-mode/latency/DX12-compiler model
-  - `src/gpu_timer.rs` — per-pass GPU timing via timestamp queries
-  - `src/bench.rs` — frame stats, benchmark sweep state machine, JSON persistence
-- Benchmark results land in `benchmarks/` (gitignored)
-- Native helper binary: `src/bin/test_parse.rs`
-- Browser app code: `apps/web/src/`
-- Browser shader API/watch server: `apps/web/server/`
-- Shader corpus: `shaders/`
-- Kerr-Newman port docs and references: `docs/kerr-newman-port/`
+| Area | Entry point | Owns |
+| --- | --- | --- |
+| Gallery | `shaders/catalog.json` | Example order, identity, credit, source paths |
+| Shader compiler | `shader-core/src/lib.rs`, `templates.rs` | Parsing, uniform/coordinate conventions, validation, WGSL preparation, HLSL generation |
+| Native selection and reload | `src/main.rs`, `src/document.rs` | File watching, compiler worker, last successful document, Slang |
+| Native display | `src/viewer.rs`, `src/renderer.rs` | egui viewer, physical render targets, passes, captures |
+| Native measurements | `src/gpu_timer.rs`, `src/bench.rs`, `src/render_settings.rs` | Timestamp readback, reproducible sweeps, device/present settings |
+| Browser | `apps/web/src/main.ts`, `renderer/`, `worker/compiler.worker.ts` | Playback, source inspector, renderers, local compilation |
+| Static catalog build | `apps/web/scripts/build-shader-manifest.mjs` | Precompiled examples, compiler integrity and distribution |
+| Regression checks | `tests/verify_viewers.py`, `tests/reference/` | Browser and native GPU captures, reloads, round trips and benchmark |
 
-## High-Value Docs
+## Compiler setup
 
-- Product direction and repo contract:
-  - `CLAUDE.md`
-  - `AGENTS.md`
-- Current planning/tracking:
-  - `ROADMAP.md`
-  - `TIMELINE.md`
-- Shader navigation and token-saving rules:
-  - `docs/SHADER_INDEX.md`
-  - `docs/WORKING_RULES.md`
+The native build provisions a checksum-pinned Slang distribution into the Cargo target directory on supported hosts. Set `PST_SLANGC` to use an installed `slangc`. To distribute a native executable, place the compiler distribution at `compilers/slang/` alongside the executable, preserving its `bin/` and library directories. The installer takes a destination, e.g. `python tools/compilers.py native target/release/compilers/slang`.
 
-## Common Run Commands
+The browser ships a prebuilt Rust/WASM core. To regenerate it, install wasm-pack and the Rust `wasm32-unknown-unknown` target, then run `python tools/build-core.py`. The script provisions WASI SDK 34. An existing SDK can be selected with `WASI_SDK_PATH`. Node prebuild verifies the fingerprint, prepares both examples and installs the pinned browser Slang distribution. A fresh build needs network access to the compiler releases. Catalog playback uses the prepared artifacts directly.
 
-- Native app:
-  - `cargo run --bin personal-shadertoy`
-- Headless benchmark sweep (runs all backends, saves JSON, exits):
-  - `$env:PST_AUTO_BENCH = '3,10'; $env:PST_AUTO_BENCH_SHADER = 'shaders\Test\test5.wgsl'; cargo run --bin personal-shadertoy`
-- Native parser smoke test:
-  - `cargo run --bin test_parse shaders/Shadertoy/kerr_newman_black_hole.glsl`
-- Native WGSL multipass centering smoke test:
-  - `cargo run --bin test_parse_wgsl shaders/Test/test5.wgsl`
-- Browser app:
-  - `cd apps/web && npm run dev`
+## Verification
 
-## Read Order For New Tasks
+```sh
+cargo test --workspace --locked
+cargo build --release --locked
+npm --prefix apps/web run build
+python -m pip install Pillow playwright
+python tests/verify_viewers.py
+```
 
-1. Read `CLAUDE.md` or `AGENTS.md`.
-2. Read this file.
-3. Read `ROADMAP.md` and `TIMELINE.md`.
-4. If the task is shader-specific, read `docs/SHADER_INDEX.md`.
-5. Only then open raw shader files, and only the specific ones needed.
+The hardware test uses installed Google Chrome and a Windows GPU with DX12, Vulkan and OpenGL. It writes evidence into ignored `target/viewer-checks/`. A native preview-only capture can also be run directly.
+
+```sh
+cargo run --release --locked -- --example Kerr --backend dx12 --size 1280x720 --capture kerr.png --frames 8
+```
+
+To benchmark from PowerShell, set `$env:PST_AUTO_BENCH='0.5,1'` and `$env:PST_AUTO_BENCH_SHADER='tests/fixtures/centering.wgsl'`, then run the executable with `--size 1280x720`. It writes a JSON result to `benchmarks/` and exits. Clear those variables before an interactive run.

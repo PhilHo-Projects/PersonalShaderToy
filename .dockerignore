@@ -11,6 +11,9 @@ src
 examples
 docs
 Cargo.toml
-Cargo.lock
 *.png
 *.md
+
+apps/web/public/compilers
+tests
+**/__pycache__

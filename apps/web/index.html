@@ -1,13 +1,134 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PersonalShaderToy</title>
-  <link rel="icon" href="/favicon.svg" />
-</head>
-<body>
-  <div id="app"></div>
-  <script type="module" src="/src/main.ts"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#171c24" />
+    <link rel="icon" href="/favicon.svg" />
+    <title>PersonalShaderToy</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Shader lab</h1>
+        <label class="picker"
+          ><span>Shader</span
+          ><select id="library" aria-label="Choose shader"></select
+        ></label>
+        <div class="actions">
+          <button id="open">Open file</button
+          ><button id="paste">Paste and run</button
+          ><button id="code" disabled>View code</button>
+        </div>
+      </header>
+      <input id="file" type="file" accept=".wgsl,.glsl,.frag,.hlsl" hidden />
+      <section class="viewer" aria-label="Shader preview">
+        <div class="transport">
+          <div>
+            <h2 id="title">Loading library…</h2>
+            <span id="credit"></span>
+          </div>
+          <div class="playback">
+            <button id="play" disabled>Pause</button
+            ><button id="reset" disabled>Restart</button
+            ><button id="full">Fullscreen</button>
+          </div>
+        </div>
+        <div id="stage" tabindex="0" aria-label="Animated shader preview"></div>
+        <dl class="stats">
+          <div>
+            <dt>Rendered FPS</dt>
+            <dd id="fps">—</dd>
+          </div>
+          <div>
+            <dt>Frame time</dt>
+            <dd id="avg">—</dd>
+          </div>
+          <div>
+            <dt>p95 frame</dt>
+            <dd id="p95">—</dd>
+          </div>
+          <div>
+            <dt>Render pixels</dt>
+            <dd id="pixels">—</dd>
+          </div>
+          <div>
+            <dt>Backend</dt>
+            <dd id="backend-name">—</dd>
+          </div>
+          <div>
+            <dt>Shader GPU</dt>
+            <dd id="gpu">—</dd>
+          </div>
+        </dl>
+      </section>
+      <div class="foot">
+        <output id="status" aria-live="polite"></output
+        ><button id="advanced" aria-expanded="false">Advanced</button>
+      </div>
+      <section id="settings" hidden>
+        <label
+          >Backend<select id="backend">
+            <option value="auto">Auto</option>
+            <option value="webgl2">WebGL2</option>
+            <option value="webgpu">WebGPU</option>
+          </select></label
+        >
+        <label
+          >Render size<select id="size">
+            <option value="fit">Fit preview</option>
+            <option value="720">1280 × 720</option>
+            <option value="1080">1920 × 1080</option>
+          </select></label
+        >
+        <label
+          >Render scale<select id="scale">
+            <option value="1">100%</option>
+            <option value=".75">75%</option>
+            <option value=".5">50%</option>
+          </select></label
+        >
+        <div id="details"></div>
+        <button id="recover" hidden>Export saved browser edits</button>
+      </section>
+    </main>
+    <dialog id="inspector">
+      <div class="dialog-head">
+        <h2>Shader source</h2>
+        <button data-close>Close</button>
+      </div>
+      <div class="tools">
+        <label
+          >Language<select id="source-type">
+            <option value="original">Original</option>
+            <option value="hlsl">HLSL</option>
+          </select></label
+        ><label>Pass<select id="pass"></select></label
+        ><button id="copy-pass">Copy pass</button
+        ><button id="copy-all">Copy shader</button>
+      </div>
+      <pre tabindex="0" id="source"></pre>
+      <output id="copy-status" aria-live="polite"></output>
+    </dialog>
+    <dialog id="paste-dialog">
+      <div class="dialog-head">
+        <h2>Paste shader</h2>
+        <button data-close>Close</button>
+      </div>
+      <label
+        >Language<select id="paste-type">
+          <option value="glsl">GLSL</option>
+          <option value="hlsl">HLSL</option>
+          <option value="wgsl">WGSL</option>
+        </select></label
+      ><textarea
+        id="input"
+        aria-label="Shader to run"
+        placeholder="Paste shader source"
+        spellcheck="false"
+      ></textarea
+      ><button id="run">Run shader</button>
+    </dialog>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
 </html>

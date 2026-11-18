@@ -1,66 +1,26 @@
-# PersonalShaderToy Instructions
+# PersonalShaderToy instructions
 
-This file mirrors `CLAUDE.md`. Keep both files synchronized.
+Keep `AGENTS.md` and `CLAUDE.md` identical.
 
-## Product Direction
+## Product
 
-- The active product direction is a standalone Rust desktop shader lab built around `winit + egui + wgpu`.
-- The editor UI and the shader preview live in the same native window. We are not currently targeting a `Tauri shell + separate sidecar preview window`.
-- Inside that one window, previewing and authoring are now intentionally split into `Load Shaders` and `Create Shader`.
-- The standalone browser app stays in the repo as a separate product surface for reference and experimentation, but it is not the primary architecture target.
-- Early priorities are:
-  - stable shader loading and file browsing in the native app
-  - practical GLSL/WGSL workflows, including Shadertoy-style imports
-  - useful diagnostics without noisy debug spam
-  - safe shader-lab iteration with explicit compile/save authoring flow before polishing editor UX
-- Engine export is intentionally deferred until the standalone shader lab is reliable.
+The desktop viewer uses winit, egui and wgpu in one native window. The browser viewer is a separate static application. Both run gallery shaders and local GLSL, WGSL and HLSL fragment programs. Source inspection and copy are read-only. Desktop users can work in their own editor and save to reload. Engine-specific material and project export are deferred.
 
-## Implementation Priorities
+## Where to work
 
-1. Keep the standalone Rust app in `Cargo.toml` + `src/main.rs` functional while we iterate.
-2. Improve GLSL/WGSL compatibility and multipass behavior in the native pipeline.
-3. Treat the integrated native window as the only preview surface unless we explicitly decide otherwise later.
-4. Use the browser/Tauri code as reference or fallback only; do not let it drive new architecture decisions by default.
-5. Prefer reliable diagnostics and workflow clarity over editor polish.
-6. Keep loaded-shader previewing separate from intentional source editing whenever that reduces heavy-shader UI overhead.
-7. For native visual bugs, validate host geometry, uniforms, target sizes, and pass feedback with small diagnostic shaders before opening giant shader ports.
+- Start with `docs/PROJECT_MAP.md` for entry points and commands, `docs/SHADER_INDEX.md` for examples and fixtures, and `ROADMAP.md` for compatibility decisions. `TIMELINE.md` tracks milestones.
+- `shaders/catalog.json` is the entire bundled gallery. Keep original author credits and source intact. Put diagnostics under `tests/fixtures/` and historical experiments under `docs/`.
+- Share source preparation, pass graph semantics and compiler versions through `shader-core/`. Keep the native and browser UI, device selection and presentation code independent.
+- Build the browser copy of the compiler using `python tools/build-core.py` after changing the core or its lockfile. The site build verifies the fingerprint.
+- Run `cargo test --workspace --locked`, build both release surfaces, then run `python tests/verify_viewers.py` on a GPU for changes to bindings, host geometry, compiler output or pass sequencing.
 
-## Repo Conventions
+## Rendering invariants
 
-- Root planning/status docs:
-  - `ROADMAP.md` is the implementation plan and decision log.
-  - `TIMELINE.md` is the current implementation tracker.
-- Fast navigation docs:
-  - `docs/PROJECT_MAP.md` is the cheapest repo entry map.
-  - `docs/SHADER_INDEX.md` is the shader routing/index file.
-  - `docs/WORKING_RULES.md` is the context-discipline guide.
-- `AGENTS.md` must stay in sync with this file.
-- The primary desktop entrypoint is the root Rust app (`Cargo.toml`, `src/main.rs`).
-- The standalone browser app lives in `apps/web/` and only shares the root `shaders/` directory with the Rust app.
-- Kerr-Newman reference materials live under `docs/kerr-newman-port/reference/` and `docs/kerr-newman-port/baselines/`.
-- `shaders/Test/test5.wgsl` is the current cheap multipass centering/feedback diagnostic.
-- Avoid coupling the Rust app and browser app beyond the shared shader corpus unless we explicitly choose to do so later.
-- Avoid opening giant shader files first when a manifest or index doc can route the task.
+- Every pass owns its uniform buffer. Buffers use ping-pong feedback. Inputs from an earlier pass read this frame, inputs from a later pass or the same pass read the previous frame. The final pass is Image.
+- Preview dimensions are physical render-target pixels. Draw Image into a dedicated texture and show that texture in the UI. Use `tests/fixtures/centering.wgsl` to diagnose geometry and sampling before inspecting Kerr–Newman.
+- Preserve the last valid pipeline on failed input. Report the failed pass and source location when the compiler supplies one. Record shader-frame intervals and actual submitted GPU work separately.
+- Surface capabilities constrain presentation and usage flags. Leaving WGL for a DXGI backend requires a fresh native window. Wake the winit event loop for pending compiles and redraws.
 
-## Recent Native Rendering Notes
+## Web release
 
-- On `2026-04-24`, the long-running native multipass centering issue was traced to a host-side uniform lifetime bug, not to `test5.wgsl` shader math.
-- Each compiled native multipass pass must own and bind its own uniform buffer. Reusing one shared `multi_uniform_buf` lets later Image-pass viewport uniforms overwrite earlier offscreen pass uniforms before the GPU executes the submitted command encoder.
-- After that fix, remaining Kerr-Newman work should be treated as shader parity/visual-baseline work unless a small diagnostic shader proves a host regression.
-
-## Render Lab Notes
-
-- On `2026-06-12`, the native app gained render-lab features: render settings in `src/render_settings.rs` (backend, adapter picker, present mode, frame latency, DX12 compiler), per-pass GPU timing in `src/gpu_timer.rs`, and percentile stats plus an automated benchmark sweep in `src/bench.rs`.
-- Present mode and frame latency apply via surface reconfigure; backend, adapter, and DX12 compiler changes rebuild the renderer, reusing the window except when leaving GL (see the third invariant below).
-- Benchmark sweeps save JSON to `benchmarks/` (gitignored). Headless: set `PST_AUTO_BENCH=warmup,measure` and optionally `PST_AUTO_BENCH_SHADER=path` — the app sweeps and exits on its own.
-- Two host invariants learned from the first sweeps: never request surface usages the capabilities don't list (GL lacks `COPY_SRC`; `Surface::configure` panics), and every `about_to_wait` path must request a redraw or the Wait-driven event loop parks before the first frame.
-- Third host invariant (2026-06-12): WGL permanently sets the HWND pixel format, so DXGI refuses swapchain creation on any window the GL backend has used (`E_ACCESSDENIED`). Rebuilding away from GL therefore replaces the native window in `apply_pending_rebuild`, and `init_renderer` wraps `Surface::configure` in an error scope so failed swaps revert instead of panicking. Standalone repro: `examples/backend_swap_probe.rs`.
-
-## Web Deployment
-
-- `apps/web/` is deployed as a static site at `https://shaderlab.philippeho.dev`, a Coolify `dockerfile` application with manual releases and no webhook.
-- The Docker build context is the repository root: `base_directory: /` and `dockerfile_location: /apps/web/Dockerfile`. It cannot be `/apps/web`, because `apps/web/scripts/build-shader-manifest.mjs` reads `../../../shaders`.
-- Production uses `StaticShaderLibraryService`. The shader corpus is baked in at build time and visitor edits live only in that visitor's `localStorage`.
-- `apps/web/server/` and `HttpShaderLibraryService` are development-only and must never be exposed. The server's `POST /api/shaders/:provider/:filename` route has no authentication and no path sanitisation on `filename`.
-- The hosted app intentionally diverges from the native lab: WebGL2/WebGPU only, with no adapter picker, present-mode or frame-latency control, DX12 compiler choice, per-pass GPU timing, or benchmark sweep.
-- This repository is public. Never commit server addresses, SSH details, credentials, or secret names to tracked files.
+The public site is a manually released static Dockerfile app. Use the repository root as build context and `apps/web/Dockerfile` as the Dockerfile. The site serves baked catalog files and loads the compiler on demand in a browser worker. Local shader contents stay in the browser. Keep the site free of server-side shader write endpoints and keep deployment credentials out of this public repository.

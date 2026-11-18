@@ -1,75 +1,85 @@
-// Generates the static shader corpus that the production build serves.
-// Mirrors the extension allowlist, provider discovery, and type mapping in
-// apps/web/server/routes/shaders.ts so the static listing and the dev API agree.
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const SHADERS_DIR = path.resolve(SCRIPT_DIR, '../../../shaders');
-const OUT_DIR = path.resolve(SCRIPT_DIR, '../public/shaders');
-
-const EXTENSIONS = ['.glsl', '.frag', '.wgsl', '.hlsl'];
-
-function getShaderType(filename) {
-  const ext = path.extname(filename).toLowerCase();
-  if (ext === '.wgsl') return 'wgsl';
-  if (ext === '.hlsl') return 'hlsl';
-  return 'glsl';
+const web = fileURLToPath(new URL("../", import.meta.url));
+const root = path.resolve(web, "../..");
+const compiled = path.join(web, "compiler");
+const out = path.join(web, "public/shaders");
+const compilerAssets = path.join(web, "public/compilers");
+const hash = createHash("sha256");
+const coreFiles = (await fs.readdir(path.join(root, "shader-core/src")))
+  .filter((f) => f.endsWith(".rs"))
+  .sort();
+for (const file of [
+  "Cargo.lock",
+  "shader-core/Cargo.toml",
+  ...coreFiles.map((f) => "shader-core/src/" + f),
+]) {
+  hash.update(
+    (await fs.readFile(path.join(root, file), "utf8")).replaceAll("\r\n", "\n"),
+  );
 }
-
-function getProviders() {
-  return fs.readdirSync(SHADERS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
-    .map((d) => d.name);
+if (
+  (await fs.readFile(path.join(compiled, "source.sha256"), "utf8")).trim() !==
+  hash.digest("hex")
+) {
+  throw Error(
+    "The browser shader compiler is stale. Run python tools/build-core.py.",
+  );
 }
-
-function main() {
-  if (!fs.existsSync(SHADERS_DIR)) {
-    console.error(`Shader corpus not found at ${SHADERS_DIR}`);
-    process.exit(1);
+const install = spawnSync(
+  process.platform === "win32" ? "python" : "python3",
+  [
+    path.join(root, "tools/compilers.py"),
+    "web",
+    path.join(compilerAssets, "slang"),
+  ],
+  { stdio: "inherit" },
+);
+if (install.status !== 0)
+  throw Error("Installing the pinned Slang compiler failed.");
+await fs.mkdir(path.join(compilerAssets, "core"), { recursive: true });
+for (const name of ["shader_core.js", "shader_core_bg.wasm"])
+  await fs.copyFile(
+    path.join(compiled, name),
+    path.join(compilerAssets, "core", name),
+  );
+const core = await import(
+  pathToFileURL(path.join(compiled, "shader_core.js")).href
+);
+await core.default({
+  module_or_path: await fs.readFile(path.join(compiled, "shader_core_bg.wasm")),
+});
+const catalog = JSON.parse(
+  await fs.readFile(path.join(root, "shaders/catalog.json"), "utf8"),
+);
+const fresh = await fs.mkdtemp(path.join(web, "public/.catalog-"));
+try {
+  for (const entry of catalog) {
+    const source = await fs.readFile(
+      path.join(root, "shaders", entry.path),
+      "utf8",
+    );
+    const passes = JSON.parse(core.graph_json(source));
+    const prepared = passes.map((p) =>
+      JSON.parse(core.prepare_json(JSON.stringify(p), entry.language)),
+    );
+    const hlsl = prepared.map((p) => core.export_hlsl(JSON.stringify(p)));
+    await fs.writeFile(
+      path.join(fresh, entry.id + ".json"),
+      JSON.stringify({ ...entry, source, passes, prepared, hlsl }),
+    );
   }
-
-  fs.rmSync(OUT_DIR, { recursive: true, force: true });
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-
-  const manifest = {};
-  let total = 0;
-
-  for (const provider of getProviders()) {
-    const srcDir = path.join(SHADERS_DIR, provider);
-    const files = fs.readdirSync(srcDir)
-      .filter((f) => EXTENSIONS.includes(path.extname(f).toLowerCase()));
-
-    // Deliberate divergence from the dev API, which lists every provider
-    // directory even when empty: shaders/User/ exists for the native app to
-    // write into and is always empty here, and the hosted site has no way to
-    // create shaders, so an empty section would just be noise.
-    if (files.length === 0) continue;
-
-    fs.mkdirSync(path.join(OUT_DIR, provider), { recursive: true });
-
-    manifest[provider] = files
-      .map((name) => {
-        fs.copyFileSync(path.join(srcDir, name), path.join(OUT_DIR, provider, name));
-        total += 1;
-        return {
-          name,
-          provider,
-          type: getShaderType(name),
-          modified: fs.statSync(path.join(srcDir, name)).mtimeMs,
-        };
-      })
-      .sort((a, b) => b.modified - a.modified);
-  }
-
-  if (total === 0) {
-    console.error('Shader corpus is empty — refusing to emit an empty manifest.');
-    process.exit(1);
-  }
-
-  fs.writeFileSync(path.join(OUT_DIR, 'manifest.json'), JSON.stringify(manifest, null, 2));
-  console.log(`Shader manifest: ${total} files across ${Object.keys(manifest).length} providers -> ${OUT_DIR}`);
+  await fs.writeFile(
+    path.join(fresh, "manifest.json"),
+    JSON.stringify(catalog),
+  );
+  await fs.rm(out, { recursive: true, force: true });
+  await fs.rename(fresh, out);
+  console.log("Prepared " + catalog.length + " shader examples.");
+} finally {
+  await fs.rm(fresh, { recursive: true, force: true });
 }
-
-main();

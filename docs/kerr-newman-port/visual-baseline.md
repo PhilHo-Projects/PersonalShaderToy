@@ -1,5 +1,8 @@
 # Kerr-Newman Visual Baseline
 
+> Historical port notes. The gallery now renders the original GLSL directly. Current release references and the centering fixture are listed in [the shader index](../SHADER_INDEX.md). Provider paths below refer to the earlier commits.
+
+
 ## Capture Conditions
 
 - Workspace: `D:\PersonalShaderToy`

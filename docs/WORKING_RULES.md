@@ -1,44 +1,9 @@
-# Working Rules
+# Working rules
 
-## Goal
+Read `docs/PROJECT_MAP.md` for the affected entry point and `docs/SHADER_INDEX.md` for shader roles. Search the pass headers and relevant functions before opening the full Kerr–Newman source.
 
-Keep context cheap and intentional. Prefer navigational docs and manifests over ingesting giant source files.
+For a native or browser geometry regression, start with `tests/fixtures/centering.wgsl`. Check physical target size, texture origin, one uniform buffer per pass, same-frame channel order and previous-frame feedback. Validate a source edit or backend change with a preview-only capture. Compare the original Kerr–Newman with its fixed reference after the small fixture passes.
 
-## Default Read Order
+Work on compilation and graph behavior in `shader-core/`. Keep native UI and Web APIs in their respective hosts. Give local files the same validation, source inspection and error recovery as gallery items. Measure the rendered frames and report unavailable quantities explicitly.
 
-1. `CLAUDE.md` or `AGENTS.md`
-2. `docs/PROJECT_MAP.md`
-3. `ROADMAP.md`
-4. `TIMELINE.md`
-5. `docs/SHADER_INDEX.md`
-6. Shader-specific manifests/checklists before raw shader sources
-
-## Token-Saving Rules
-
-- Do not open `shaders/Shadertoy/kerr_newman_black_hole.glsl` unless the task is directly about Kerr-Newman behavior.
-- Do not open multiple provider copies of the same shader unless the task is explicitly comparative.
-- Prefer `rg` results, manifests, and chunk maps over full-file reads.
-- When working on Kerr-Newman, use `docs/kerr-newman-port/manifest.md` as the routing document.
-- When investigating native centering, resize artifacts, or multipass feedback drift, try `shaders/Test/test5.wgsl` before opening giant shader files.
-- When a task only touches app wiring, stay in `src/`, `apps/web/src/`, `apps/web/server/`, and root docs.
-
-## Repo Separation Rules
-
-- Native app and browser app are separate products.
-- Shared runtime surface is limited to `shaders/`.
-- Do not assume browser preview logic can be reused in the Rust app, or vice versa, without explicit design work.
-
-## Expensive Files
-
-- `shaders/Shadertoy/kerr_newman_black_hole.glsl`
-- `shaders/Test/UI Test 5.hlsl`
-- `shaders/openai/kerr_newman_black_hole_multipass.wgsl`
-- `shaders/claude/kerr_newman_multipass.wgsl`
-
-If one of these must be opened, do it narrowly and only after checking the relevant docs.
-
-## Good Practice
-
-- Link back to exact files in notes and summaries.
-- Keep `AGENTS.md` and `CLAUDE.md` short and repo-wide.
-- Put shader-specific detail in `docs/` next to that shader's working notes.
+The live site is built from the repository root using `apps/web/Dockerfile`. Keep the release manual and local source processing in the browser. Update `AGENTS.md` and `CLAUDE.md` together when the product or build contract changes.
