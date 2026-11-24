@@ -1,4 +1,4 @@
-FROM node:22.23.3-alpine AS build
+FROM node:22.23.5-alpine AS build
 RUN apk add --no-cache python3 ca-certificates
 WORKDIR /build/apps/web
 COPY apps/web/package*.json ./
@@ -9,7 +9,7 @@ COPY Cargo.lock /build/Cargo.lock
 COPY shader-core /build/shader-core
 COPY tools/compilers.py /build/tools/compilers.py
 RUN npm run build && gzip -k -9 dist/compilers/core/*.wasm dist/compilers/slang/*.wasm
-FROM nginx:1.31.7-alpine
+FROM nginx:1.31.10-alpine
 COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /build/apps/web/dist /usr/share/nginx/html
 EXPOSE 8000
